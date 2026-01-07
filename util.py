@@ -12,7 +12,10 @@ Author: Claude
 Date: 2025
 """
 
+# Force CPU-only mode - prevent any library from using GPU
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+os.environ['OPENCV_OPENCL_DEVICE'] = 'disabled'
 import json
 import pickle
 import argparse
@@ -587,7 +590,7 @@ class PillAnalyzer:
 def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
     """
     Load bounding boxes from various formats.
-    Supports: JSON, YOLO format txt, CSV
+    Supports: JSON, YOLO format txt, CSV, Pickle
     Returns list of (x, y, w, h) tuples in pixel coordinates.
     """
     bboxes = []
@@ -598,7 +601,28 @@ def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
     ext = os.path.splitext(bbox_path)[1].lower()
     
     try:
-        if ext == '.json':
+        if ext == '.pkl' or ext == '.pickle':
+            # Pickle format: [[x, y, w, h], [x, y, w, h], ...]
+            with open(bbox_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            if isinstance(data, (list, np.ndarray)):
+                for item in data:
+                    if isinstance(item, (list, tuple, np.ndarray)) and len(item) >= 4:
+                        # Handle numpy floats/ints
+                        x, y, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+                        bboxes.append((int(x), int(y), int(w), int(h)))
+            elif isinstance(data, dict):
+                # In case it's a dict with 'bboxes' key or similar
+                for key in ['bboxes', 'boxes', 'detections', 'bbox']:
+                    if key in data:
+                        for item in data[key]:
+                            if len(item) >= 4:
+                                x, y, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+                                bboxes.append((int(x), int(y), int(w), int(h)))
+                        break
+        
+        elif ext == '.json':
             with open(bbox_path, 'r') as f:
                 data = json.load(f)
             
@@ -1074,7 +1098,7 @@ def find_image_bbox_pairs(images_dir: str, bboxes_dir: str) -> List[Tuple[str, s
     Match images with their corresponding bbox files.
     """
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
-    bbox_extensions = {'.json', '.txt', '.csv'}
+    bbox_extensions = {'.json', '.txt', '.csv', '.pkl', '.pickle'}
     
     pairs = []
     
