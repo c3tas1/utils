@@ -1085,7 +1085,7 @@ def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
     
     try:
         if ext == '.pkl' or ext == '.pickle':
-            # Pickle format: [[x, y, w, h], [x, y, w, h], ...]
+            # Pickle format: [[x, y, w, h], ...] OR [[x1, y1, x2, y2], ...]
             with open(bbox_path, 'rb') as f:
                 data = pickle.load(f)
             
@@ -1093,16 +1093,40 @@ def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
                 for item in data:
                     if isinstance(item, (list, tuple, np.ndarray)) and len(item) >= 4:
                         # Handle numpy floats/ints
-                        x, y, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
-                        bboxes.append((int(x), int(y), int(w), int(h)))
+                        v0, v1, v2, v3 = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+                        
+                        # Auto-detect format: x1,y1,x2,y2 vs x,y,w,h
+                        # If v2 > v0 and v3 > v1 significantly, likely x1,y1,x2,y2 format
+                        # (x2 should be > x1 and y2 should be > y1)
+                        # For x,y,w,h format, w and h are typically much smaller than x,y
+                        
+                        # Heuristic: if v2 > v0 and v3 > v1, and the "width" (v2-v0) is reasonable
+                        # compared to v2 and v3, it's probably x1,y1,x2,y2
+                        if v2 > v0 and v3 > v1:
+                            # Likely x1, y1, x2, y2 format - convert to x, y, w, h
+                            x, y = int(v0), int(v1)
+                            w, h = int(v2 - v0), int(v3 - v1)
+                        else:
+                            # Assume x, y, w, h format
+                            x, y, w, h = int(v0), int(v1), int(v2), int(v3)
+                        
+                        if w > 0 and h > 0:
+                            bboxes.append((x, y, w, h))
+                            
             elif isinstance(data, dict):
                 # In case it's a dict with 'bboxes' key or similar
                 for key in ['bboxes', 'boxes', 'detections', 'bbox']:
                     if key in data:
                         for item in data[key]:
                             if len(item) >= 4:
-                                x, y, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
-                                bboxes.append((int(x), int(y), int(w), int(h)))
+                                v0, v1, v2, v3 = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+                                if v2 > v0 and v3 > v1:
+                                    x, y = int(v0), int(v1)
+                                    w, h = int(v2 - v0), int(v3 - v1)
+                                else:
+                                    x, y, w, h = int(v0), int(v1), int(v2), int(v3)
+                                if w > 0 and h > 0:
+                                    bboxes.append((x, y, w, h))
                         break
         
         elif ext == '.json':
