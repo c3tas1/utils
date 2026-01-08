@@ -1971,6 +1971,238 @@ class PillQualityAssessor:
 
 
 # =============================================================================
+# DEBUG / DIAGNOSTIC MODE
+# =============================================================================
+
+def debug_analyze_image(image_path: str, bbox_path: str, output_dir: str):
+    """
+    Detailed debug analysis of a single image with visual output.
+    """
+    print(f"\n{'='*70}")
+    print(f"DEBUG ANALYSIS: {os.path.basename(image_path)}")
+    print(f"{'='*70}")
+    
+    # Load image
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"ERROR: Could not load image: {image_path}")
+        return
+    
+    img_height, img_width = image.shape[:2]
+    print(f"Image size: {img_width} x {img_height}")
+    
+    # Load bboxes
+    bboxes = load_bboxes(bbox_path)
+    bboxes = convert_yolo_bboxes(bboxes, img_width, img_height)
+    print(f"Loaded {len(bboxes)} bounding boxes")
+    
+    if not bboxes:
+        print("WARNING: No bboxes loaded! Check bbox file format.")
+        print(f"  Bbox path: {bbox_path}")
+        print(f"  Exists: {os.path.exists(bbox_path)}")
+        if os.path.exists(bbox_path):
+            with open(bbox_path, 'rb') as f:
+                raw_data = pickle.load(f)
+            print(f"  Raw data type: {type(raw_data)}")
+            print(f"  Raw data sample: {raw_data[:3] if isinstance(raw_data, list) else raw_data}")
+        return
+    
+    # Show bbox samples
+    print(f"\nBbox samples (first 3):")
+    for i, bbox in enumerate(bboxes[:3]):
+        print(f"  {i}: {bbox}")
+    
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Compute image-level metrics
+    print(f"\n--- IMAGE-LEVEL METRICS ---")
+    metrics_computer = QualityMetricsComputer()
+    
+    # Individual metric computation with output
+    lap_var = metrics_computer.compute_laplacian_variance(gray)
+    print(f"Laplacian variance (blur):  {lap_var:.2f}")
+    
+    tenengrad = metrics_computer.compute_tenengrad(gray)
+    print(f"Tenengrad (blur):           {tenengrad:.2f}")
+    
+    fft_ratio = metrics_computer.compute_fft_blur_metric(gray)
+    print(f"FFT high-freq ratio:        {fft_ratio:.4f}")
+    
+    brightness = metrics_computer.compute_brightness_metrics(gray)
+    print(f"Mean brightness:            {brightness['mean_brightness']:.2f}")
+    print(f"Brightness std:             {brightness['brightness_std']:.2f}")
+    print(f"Overexposed ratio:          {brightness['overexposed_ratio']*100:.2f}%")
+    print(f"Underexposed ratio:         {brightness['underexposed_ratio']*100:.2f}%")
+    
+    uniformity = metrics_computer.compute_local_uniformity(gray)
+    print(f"Brightness uniformity:      {uniformity['brightness_uniformity']:.4f}")
+    print(f"Blur uniformity:            {uniformity['blur_uniformity']:.4f}")
+    
+    light = metrics_computer.compute_light_intrusion_metrics(image, bboxes)
+    print(f"Light blob score:           {light['light_blob_score']*100:.4f}%")
+    print(f"Light in pill region:       {light['light_in_pill_region']*100:.4f}%")
+    print(f"Light in background:        {light['light_in_background']*100:.4f}%")
+    
+    # Compute pill-level metrics
+    print(f"\n--- PILL-LEVEL ANALYSIS ---")
+    
+    valid_bboxes = [(x, y, w, h) for x, y, w, h in bboxes 
+                   if isinstance((x, y, w, h), tuple) and h > 0 and w > 0]
+    
+    areas = [w * h for x, y, w, h in valid_bboxes]
+    aspect_ratios = [w / h for x, y, w, h in valid_bboxes]
+    norm_aspects = [max(ar, 1.0/ar) if ar > 0 else 1.0 for ar in aspect_ratios]
+    
+    print(f"\nBbox statistics:")
+    print(f"  Area - min: {min(areas):.0f}, max: {max(areas):.0f}, median: {np.median(areas):.0f}, std: {np.std(areas):.0f}")
+    print(f"  Aspect ratio - min: {min(norm_aspects):.2f}, max: {max(norm_aspects):.2f}, median: {np.median(norm_aspects):.2f}, std: {np.std(norm_aspects):.2f}")
+    
+    # Analyze a few pills
+    pill_analyzer = PillAnalyzer()
+    
+    # Compute bbox stats
+    bbox_stats = {
+        'median_area': float(np.median(areas)),
+        'mean_area': float(np.mean(areas)),
+        'area_std': float(np.std(areas)),
+        'q1_area': float(np.percentile(areas, 25)),
+        'q3_area': float(np.percentile(areas, 75)),
+        'median_aspect_ratio': float(np.median(norm_aspects)),
+        'mean_aspect_ratio': float(np.mean(norm_aspects)),
+        'aspect_ratio_std': float(np.std(norm_aspects)),
+        'q1_aspect': float(np.percentile(norm_aspects, 25)),
+        'q3_aspect': float(np.percentile(norm_aspects, 75)),
+        'num_pills': len(valid_bboxes)
+    }
+    
+    # First pass for blur/brightness stats
+    first_pass_metrics = []
+    for i, bbox in enumerate(bboxes[:min(len(bboxes), 200)]):  # Limit for speed
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            continue
+        x, y, w, h = bbox
+        x, y = max(0, x), max(0, y)
+        w, h = min(w, img_width - x), min(h, img_height - y)
+        
+        if w > 0 and h > 0:
+            crop = image[y:y+h, x:x+w]
+            crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+            
+            lap_var = cv2.Laplacian(crop_gray, cv2.CV_64F).var()
+            bright = float(np.mean(crop_gray))
+            
+            first_pass_metrics.append({
+                'laplacian': lap_var,
+                'brightness': bright,
+            })
+    
+    if first_pass_metrics:
+        lap_values = [m['laplacian'] for m in first_pass_metrics]
+        bright_values = [m['brightness'] for m in first_pass_metrics]
+        
+        bbox_stats.update({
+            'median_laplacian': float(np.median(lap_values)),
+            'laplacian_std': float(np.std(lap_values)),
+            'q1_laplacian': float(np.percentile(lap_values, 25)),
+            'q3_laplacian': float(np.percentile(lap_values, 75)),
+            'median_brightness': float(np.median(bright_values)),
+            'brightness_std': float(np.std(bright_values)),
+            'q1_brightness': float(np.percentile(bright_values, 25)),
+            'q3_brightness': float(np.percentile(bright_values, 75)),
+        })
+        
+        print(f"\nPill metrics statistics:")
+        print(f"  Laplacian - median: {bbox_stats['median_laplacian']:.2f}, std: {bbox_stats['laplacian_std']:.2f}")
+        print(f"  Brightness - median: {bbox_stats['median_brightness']:.2f}, std: {bbox_stats['brightness_std']:.2f}")
+    
+    # Analyze sample pills
+    print(f"\n--- SAMPLE PILL ANALYSIS (first 10) ---")
+    
+    issues_summary = {
+        'stacking': 0,
+        'on_side': 0,
+        'blur_outlier': 0,
+        'brightness_outlier': 0,
+        'motion_blur': 0,
+    }
+    
+    for i, bbox in enumerate(bboxes[:10]):
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            continue
+        
+        pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
+        
+        issues = []
+        if pm.is_stacking:
+            issues.append("STACKING")
+            issues_summary['stacking'] += 1
+        if pm.is_on_side:
+            issues.append("ON_SIDE")
+            issues_summary['on_side'] += 1
+        if pm.is_blur_outlier:
+            issues.append("BLUR_OUTLIER")
+            issues_summary['blur_outlier'] += 1
+        if pm.is_brightness_outlier:
+            issues.append(f"BRIGHT_OUTLIER({pm.brightness_outlier_type})")
+            issues_summary['brightness_outlier'] += 1
+        if pm.has_motion_blur:
+            issues.append("MOTION_BLUR")
+            issues_summary['motion_blur'] += 1
+        
+        status = "⚠️ " + ", ".join(issues) if issues else "✓ OK"
+        print(f"  Pill {i}: bbox={bbox}, lap={pm.laplacian_variance:.1f}, bright={pm.mean_brightness:.1f}, aspect={pm.aspect_ratio:.2f} → {status}")
+    
+    # Full analysis
+    print(f"\n--- FULL PILL ANALYSIS SUMMARY ---")
+    all_issues = {k: 0 for k in issues_summary.keys()}
+    
+    for i, bbox in enumerate(bboxes):
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            continue
+        pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
+        
+        if pm.is_stacking: all_issues['stacking'] += 1
+        if pm.is_on_side: all_issues['on_side'] += 1
+        if pm.is_blur_outlier: all_issues['blur_outlier'] += 1
+        if pm.is_brightness_outlier: all_issues['brightness_outlier'] += 1
+        if pm.has_motion_blur: all_issues['motion_blur'] += 1
+    
+    print(f"Total pills analyzed: {len(bboxes)}")
+    for issue, count in all_issues.items():
+        pct = 100 * count / len(bboxes) if bboxes else 0
+        print(f"  {issue}: {count} ({pct:.1f}%)")
+    
+    # Create debug visualization
+    debug_img = image.copy()
+    
+    for i, bbox in enumerate(bboxes):
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            continue
+        x, y, w, h = bbox
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        
+        pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
+        
+        # Color based on issues
+        if pm.is_stacking or pm.is_on_side:
+            color = (0, 0, 255)  # Red
+        elif pm.is_blur_outlier or pm.has_motion_blur:
+            color = (0, 165, 255)  # Orange
+        elif pm.is_brightness_outlier:
+            color = (0, 255, 255)  # Yellow
+        else:
+            color = (0, 255, 0)  # Green
+        
+        cv2.rectangle(debug_img, (x, y), (x+w, y+h), color, 2)
+    
+    # Save debug image
+    debug_path = os.path.join(output_dir, f"debug_{os.path.basename(image_path)}")
+    cv2.imwrite(debug_path, debug_img)
+    print(f"\nDebug visualization saved: {debug_path}")
+    print("  Green = OK, Red = Stacking/OnSide, Orange = Blur/Motion, Yellow = Brightness")
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1991,6 +2223,9 @@ Examples:
 
   # Custom percentile for filtering
   python pill_quality_assessment.py --images ./images_consolidated --bboxes ./bboxes --output ./results --percentile 20
+  
+  # Debug mode - analyze specific images with visual output
+  python pill_quality_assessment.py --images ./images_consolidated --bboxes ./bboxes --output ./results --debug --debug-images img1.jpg img2.jpg
         """
     )
     
@@ -2008,6 +2243,10 @@ Examples:
                        help='Only run calibration phase')
     parser.add_argument('--inference-only', action='store_true',
                        help='Only run inference phase (requires existing thresholds)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode with detailed output')
+    parser.add_argument('--debug-images', nargs='*', default=None,
+                       help='Specific image filenames to debug (used with --debug)')
     
     args = parser.parse_args()
     
@@ -2019,6 +2258,42 @@ Examples:
     if not os.path.isdir(args.bboxes):
         print(f"Error: Bboxes directory not found: {args.bboxes}")
         return 1
+    
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
+    
+    # Debug mode - analyze specific images with detailed output
+    if args.debug:
+        print("=" * 70)
+        print("DEBUG MODE - Detailed Image Analysis")
+        print("=" * 70)
+        
+        # Find image-bbox pairs
+        pairs = find_image_bbox_pairs(args.images, args.bboxes)
+        
+        if args.debug_images:
+            # Filter to specific images
+            debug_set = set(args.debug_images)
+            pairs = [(img, bbox) for img, bbox in pairs 
+                    if os.path.basename(img) in debug_set or 
+                       os.path.splitext(os.path.basename(img))[0] in debug_set]
+        else:
+            # Take first 5 images if none specified
+            pairs = pairs[:5]
+        
+        if not pairs:
+            print("No images found to debug!")
+            return 1
+        
+        print(f"Debugging {len(pairs)} images...")
+        
+        for image_path, bbox_path in pairs:
+            debug_analyze_image(image_path, bbox_path, args.output)
+        
+        print("\n" + "=" * 70)
+        print("Debug complete! Check output directory for visualizations.")
+        print("=" * 70)
+        return 0
     
     # Create assessor
     assessor = PillQualityAssessor(
