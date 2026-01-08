@@ -680,183 +680,18 @@ class PillAnalyzer:
     def __init__(self):
         self.metrics_computer = QualityMetricsComputer()
     
-    def detect_pill_on_side(self, gray: np.ndarray, bbox: Tuple[int, int, int, int],
-                           all_bbox_stats: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Detect if a pill is placed on its side (edge-on) instead of flat.
-        
-        Compares this pill against OTHER pills in the SAME image to find outliers.
-        Since most pills are flat, the median/majority represents the "normal" flat orientation.
-        Pills on side will be statistical outliers.
-        
-        Args:
-            gray: Grayscale pill crop
-            bbox: Bounding box (x, y, w, h)
-            all_bbox_stats: Statistics from all bboxes in this image:
-                - median_area: median pill area
-                - median_aspect_ratio: median aspect ratio  
-                - aspect_ratio_std: standard deviation of aspect ratios
-                - area_std: standard deviation of areas
-                - q1_area, q3_area: quartiles for area
-                - q1_aspect, q3_aspect: quartiles for aspect ratio
-            
-        Returns:
-            Dict with orientation detection results
-        """
-        x, y, w, h = bbox
-        area = w * h
-        aspect_ratio = w / h if h > 0 else 1.0
-        
-        # Normalize aspect ratio to always be >= 1 (longer dimension / shorter)
-        norm_aspect = max(aspect_ratio, 1.0 / aspect_ratio) if aspect_ratio > 0 else 1.0
-        
-        median_area = all_bbox_stats.get('median_area', area)
-        median_aspect = all_bbox_stats.get('median_aspect_ratio', 1.0)
-        median_norm_aspect = max(median_aspect, 1.0 / median_aspect) if median_aspect > 0 else 1.0
-        
-        aspect_std = all_bbox_stats.get('aspect_ratio_std', 0.5)
-        area_std = all_bbox_stats.get('area_std', median_area * 0.3)
-        
-        q1_area = all_bbox_stats.get('q1_area', median_area * 0.7)
-        q3_area = all_bbox_stats.get('q3_area', median_area * 1.3)
-        q1_aspect = all_bbox_stats.get('q1_aspect', median_norm_aspect * 0.8)
-        q3_aspect = all_bbox_stats.get('q3_aspect', median_norm_aspect * 1.2)
-        
-        is_on_side = False
-        orientation_score = 0.0
-        reasons = []
-        
-        # === Check 1: Statistical outlier detection using IQR method ===
-        # Pills on side will be outliers in aspect ratio AND/OR area
-        
-        # IQR for aspect ratio
-        iqr_aspect = q3_aspect - q1_aspect
-        aspect_upper_fence = q3_aspect + 1.5 * iqr_aspect
-        
-        # IQR for area  
-        iqr_area = q3_area - q1_area
-        area_lower_fence = q1_area - 1.5 * iqr_area
-        
-        # Check if this pill is an outlier
-        is_aspect_outlier = norm_aspect > aspect_upper_fence and iqr_aspect > 0.1
-        is_area_outlier = area < area_lower_fence and iqr_area > 100
-        
-        if is_aspect_outlier:
-            orientation_score += 0.35
-            reasons.append(f"aspect_ratio_outlier_{norm_aspect:.2f}_vs_median_{median_norm_aspect:.2f}")
-        
-        if is_area_outlier:
-            orientation_score += 0.3
-            reasons.append(f"area_outlier_{area}_vs_median_{median_area:.0f}")
-        
-        # === Check 2: Z-score based detection ===
-        # How many standard deviations away from the mean?
-        
-        if aspect_std > 0.05:
-            aspect_zscore = (norm_aspect - median_norm_aspect) / aspect_std
-            if aspect_zscore > 2.0:  # More than 2 std devs above median
-                orientation_score += 0.25
-                reasons.append(f"aspect_zscore_{aspect_zscore:.2f}")
-        
-        if area_std > 50 and median_area > 0:
-            area_zscore = (median_area - area) / area_std  # Negative because smaller is suspicious
-            if area_zscore > 2.0:  # More than 2 std devs below median
-                orientation_score += 0.2
-                reasons.append(f"area_zscore_{area_zscore:.2f}")
-        
-        # === Check 3: Combined ratio check ===
-        # Pills on side: much higher aspect ratio AND much smaller area simultaneously
-        
-        if median_area > 0 and median_norm_aspect > 0:
-            area_ratio = area / median_area
-            aspect_deviation = norm_aspect / median_norm_aspect
-            
-            # Strong indicator: elongated AND small
-            if aspect_deviation > 1.5 and area_ratio < 0.6:
-                orientation_score += 0.3
-                reasons.append("elongated_and_small")
-            elif aspect_deviation > 1.3 and area_ratio < 0.7:
-                orientation_score += 0.15
-                reasons.append("moderately_elongated_and_reduced_area")
-        
-        # === Check 4: Edge profile analysis (only if other checks suggest on-side) ===
-        # This is more expensive, so only run if we have initial suspicion
-        
-        if orientation_score >= 0.2 and gray.shape[0] > 10 and gray.shape[1] > 10:
-            edges = cv2.Canny(gray, 50, 150)
-            
-            # Detect strong parallel lines (characteristic of side-placed pills)
-            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=15,
-                                    minLineLength=min(w, h) * 0.4,
-                                    maxLineGap=5)
-            
-            if lines is not None and len(lines) >= 2:
-                # Analyze line orientations
-                horizontal_lines = 0
-                vertical_lines = 0
-                
-                for line in lines:
-                    x1, y1, x2, y2 = line[0]
-                    length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
-                    
-                    if length > min(w, h) * 0.3:
-                        angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
-                        if angle < 25 or angle > 155:  # Near horizontal
-                            horizontal_lines += 1
-                        elif 65 < angle < 115:  # Near vertical
-                            vertical_lines += 1
-                
-                # Pills on side have strong parallel edges along one axis
-                if horizontal_lines >= 2 or vertical_lines >= 2:
-                    dominant_lines = max(horizontal_lines, vertical_lines)
-                    if dominant_lines >= 2:
-                        orientation_score += 0.15
-                        reasons.append(f"parallel_edges_{dominant_lines}_lines")
-            
-            # Rectangularity check
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if contours:
-                largest_contour = max(contours, key=cv2.contourArea)
-                contour_area = cv2.contourArea(largest_contour)
-                
-                if contour_area > 100 and len(largest_contour) >= 5:
-                    rect = cv2.minAreaRect(largest_contour)
-                    rect_area = rect[1][0] * rect[1][1]
-                    
-                    # High rectangularity suggests side placement
-                    rectangularity = contour_area / (rect_area + 1e-10)
-                    if rectangularity > 0.88:
-                        orientation_score += 0.1
-                        reasons.append(f"rectangular_profile_{rectangularity:.2f}")
-        
-        # === Final determination ===
-        # Require sufficient evidence before flagging
-        if orientation_score >= 0.5:
-            is_on_side = True
-        
-        # Edge thickness ratio
-        edge_thickness_ratio = min(w, h) / max(w, h) if max(w, h) > 0 else 1.0
-        
-        return {
-            'is_on_side': is_on_side,
-            'orientation_score': orientation_score,
-            'edge_thickness_ratio': edge_thickness_ratio,
-            'normalized_aspect_ratio': norm_aspect,
-            'reasons': reasons
-        }
     
     def compute_overlap_ratio(self, bbox: Tuple[int, int, int, int], 
                              all_bboxes: List[Tuple[int, int, int, int]]) -> Tuple[float, bool]:
         """
-        Compute overlap ratio with other bboxes to detect TRUE stacking.
+        Detect TRUE stacking - one pill physically on top of another.
         
-        Stacking = one pill physically on top of another (significant area overlap)
-        NOT stacking = pills placed side by side (edge touching only)
+        Stacking criteria:
+        - Significant intersection area (>20% of the smaller pill)
+        - Not just edge touching
         
         Returns:
-            (overlap_ratio, is_true_stacking)
+            (max_overlap_ratio, is_stacking)
         """
         x1, y1, w1, h1 = bbox
         box1_area = w1 * h1
@@ -866,10 +701,6 @@ class PillAnalyzer:
         
         max_overlap = 0.0
         is_stacking = False
-        
-        # Minimum overlap threshold to be considered stacking
-        # Pills side-by-side might have tiny edge overlaps due to bbox inaccuracy
-        MIN_STACKING_OVERLAP = 0.15  # At least 15% of pill area overlapping
         
         for other in all_bboxes:
             if other == bbox:
@@ -888,36 +719,83 @@ class PillAnalyzer:
             iy2 = min(y1 + h1, y2 + h2)
             
             if ix2 > ix1 and iy2 > iy1:
-                intersection_w = ix2 - ix1
-                intersection_h = iy2 - iy1
-                intersection_area = intersection_w * intersection_h
+                intersection_area = (ix2 - ix1) * (iy2 - iy1)
                 
-                # Overlap relative to smaller box (more sensitive to stacking)
+                # Overlap relative to smaller box
                 smaller_area = min(box1_area, box2_area)
                 overlap_ratio = intersection_area / smaller_area
-                
-                # Check if this is TRUE stacking vs edge touching
-                # True stacking: significant overlap in BOTH dimensions
-                # Edge touching: overlap is thin strip along one edge
-                
-                # Calculate what fraction of each dimension is overlapping
-                overlap_w_ratio = intersection_w / min(w1, w2)
-                overlap_h_ratio = intersection_h / min(h1, h2)
-                
-                # True stacking requires substantial overlap in both dimensions
-                # (not just a thin sliver along an edge)
-                is_substantial_2d_overlap = (overlap_w_ratio > 0.3 and overlap_h_ratio > 0.3)
                 
                 if overlap_ratio > max_overlap:
                     max_overlap = overlap_ratio
                 
-                # Only flag as stacking if:
-                # 1. Significant area overlap (>15%)
-                # 2. Overlap is substantial in both dimensions (not edge touching)
-                if overlap_ratio > MIN_STACKING_OVERLAP and is_substantial_2d_overlap:
+                # Stacking = significant overlap (>20% of smaller pill)
+                if overlap_ratio > 0.20:
                     is_stacking = True
         
         return max_overlap, is_stacking
+    
+    def detect_pill_orientation(self, bbox: Tuple[int, int, int, int],
+                                bbox_stats: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Detect if pill is placed on its side using simple, robust metrics.
+        
+        Side-placed pill characteristics:
+        1. Significantly more elongated than siblings (high aspect ratio)
+        2. Significantly smaller area than siblings
+        
+        Uses IQR-based outlier detection for robustness.
+        """
+        x, y, w, h = bbox
+        area = w * h
+        aspect_ratio = max(w/h, h/w) if h > 0 and w > 0 else 1.0  # Always >= 1
+        
+        # Get statistics
+        median_area = bbox_stats.get('median_area', area)
+        q1_area = bbox_stats.get('q1_area', median_area * 0.7)
+        q3_area = bbox_stats.get('q3_area', median_area * 1.3)
+        
+        median_aspect = bbox_stats.get('median_aspect_ratio', 1.0)
+        q1_aspect = bbox_stats.get('q1_aspect', 1.0)
+        q3_aspect = bbox_stats.get('q3_aspect', 1.5)
+        
+        # IQR calculations
+        iqr_area = q3_area - q1_area
+        iqr_aspect = q3_aspect - q1_aspect
+        
+        # Outlier thresholds (1.5 * IQR is standard)
+        area_lower_fence = q1_area - 1.5 * iqr_area
+        aspect_upper_fence = q3_aspect + 1.5 * iqr_aspect
+        
+        # Detection flags
+        is_small_outlier = area < area_lower_fence if iqr_area > 100 else False
+        is_elongated_outlier = aspect_ratio > aspect_upper_fence if iqr_aspect > 0.1 else False
+        
+        # Side placement = elongated AND/OR unusually small
+        # Being both is strong evidence, being one is weak evidence
+        is_on_side = False
+        confidence = 0.0
+        
+        if is_elongated_outlier and is_small_outlier:
+            # Strong evidence - both criteria met
+            is_on_side = True
+            confidence = 0.9
+        elif is_elongated_outlier and (area < median_area * 0.7):
+            # Elongated and somewhat small
+            is_on_side = True
+            confidence = 0.7
+        elif aspect_ratio > 2.5 and area < median_area * 0.5:
+            # Very elongated and quite small (absolute thresholds)
+            is_on_side = True
+            confidence = 0.6
+        
+        return {
+            'is_on_side': is_on_side,
+            'confidence': confidence,
+            'aspect_ratio': aspect_ratio,
+            'area_ratio': area / median_area if median_area > 0 else 1.0,
+            'is_small_outlier': is_small_outlier,
+            'is_elongated_outlier': is_elongated_outlier
+        }
     
     def analyze_pill(self, image: np.ndarray, bbox: Tuple[int, int, int, int],
                     bbox_id: int, all_bboxes: List[Tuple[int, int, int, int]],
@@ -974,11 +852,11 @@ class PillAnalyzer:
         if median_area > 0:
             metrics.area_deviation = abs(area - median_area) / median_area
         
-        # Pill orientation detection (on side vs flat) - uses statistical comparison
-        orientation = self.detect_pill_on_side(gray, bbox, bbox_stats)
+        # Pill orientation detection (on side vs flat) - simple geometric comparison
+        orientation = self.detect_pill_orientation(bbox, bbox_stats)
         metrics.is_on_side = orientation['is_on_side']
-        metrics.orientation_score = orientation['orientation_score']
-        metrics.edge_thickness_ratio = orientation['edge_thickness_ratio']
+        metrics.orientation_score = orientation['confidence']
+        metrics.edge_thickness_ratio = min(w, h) / max(w, h) if max(w, h) > 0 else 1.0
         
         # Edge analysis for partial occlusion detection
         edges = cv2.Canny(gray, 50, 150)
@@ -2139,7 +2017,127 @@ def debug_analyze_image(image_path: str, bbox_path: str, output_dir: str):
         print(f"  Laplacian - median: {bbox_stats['median_laplacian']:.2f}, std: {bbox_stats['laplacian_std']:.2f}")
         print(f"  Brightness - median: {bbox_stats['median_brightness']:.2f}, std: {bbox_stats['brightness_std']:.2f}")
     
-    # Analyze sample pills
+    # Show detection thresholds being used
+    print(f"\n--- DETECTION THRESHOLDS ---")
+    print(f"Stacking: overlap > 20% of smaller pill")
+    
+    # IQR-based thresholds for on-side detection
+    median_aspect = bbox_stats.get('median_aspect_ratio', 1.0)
+    q1_aspect = bbox_stats.get('q1_aspect', 1.0)
+    q3_aspect = bbox_stats.get('q3_aspect', 1.5)
+    iqr_aspect = q3_aspect - q1_aspect
+    aspect_upper_fence = q3_aspect + 1.5 * iqr_aspect
+    
+    median_area = bbox_stats.get('median_area', 0)
+    q1_area = bbox_stats.get('q1_area', median_area * 0.7)
+    q3_area = bbox_stats.get('q3_area', median_area * 1.3)
+    iqr_area = q3_area - q1_area
+    area_lower_fence = q1_area - 1.5 * iqr_area
+    
+    print(f"On-Side detection:")
+    print(f"  Aspect ratio - median: {median_aspect:.2f}, Q1: {q1_aspect:.2f}, Q3: {q3_aspect:.2f}, IQR: {iqr_aspect:.2f}")
+    print(f"  → Flagged if aspect > {aspect_upper_fence:.2f} (Q3 + 1.5*IQR)")
+    print(f"  Area - median: {median_area:.0f}, Q1: {q1_area:.0f}, Q3: {q3_area:.0f}, IQR: {iqr_area:.0f}")
+    print(f"  → Flagged if area < {area_lower_fence:.0f} (Q1 - 1.5*IQR)")
+    
+    # Analyze ALL pills and collect detailed data
+    print(f"\n--- DETAILED PILL ANALYSIS ---")
+    
+    all_pill_data = []
+    for i, bbox in enumerate(bboxes):
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            continue
+        
+        x, y, w, h = bbox
+        area = w * h
+        aspect = max(w/h, h/w) if h > 0 and w > 0 else 1.0
+        
+        pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
+        
+        all_pill_data.append({
+            'idx': i,
+            'bbox': (x, y, w, h),
+            'area': area,
+            'aspect': aspect,
+            'overlap': pm.overlap_ratio,
+            'is_stacking': pm.is_stacking,
+            'is_on_side': pm.is_on_side,
+            'laplacian': pm.laplacian_variance,
+            'brightness': pm.mean_brightness,
+            'is_blur_outlier': pm.is_blur_outlier,
+            'is_brightness_outlier': pm.is_brightness_outlier,
+            'has_motion_blur': pm.has_motion_blur,
+        })
+    
+    # Sort by aspect ratio to see distribution
+    sorted_by_aspect = sorted(all_pill_data, key=lambda x: x['aspect'], reverse=True)
+    
+    print(f"\nTOP 10 HIGHEST ASPECT RATIO PILLS:")
+    print(f"{'Idx':<6} {'Aspect':<8} {'Area':<8} {'Overlap':<8} {'Stacking':<10} {'OnSide':<8}")
+    print("-" * 60)
+    for p in sorted_by_aspect[:10]:
+        print(f"{p['idx']:<6} {p['aspect']:<8.2f} {p['area']:<8} {p['overlap']:<8.2%} {str(p['is_stacking']):<10} {str(p['is_on_side']):<8}")
+    
+    # Sort by area (smallest first)
+    sorted_by_area = sorted(all_pill_data, key=lambda x: x['area'])
+    
+    print(f"\nTOP 10 SMALLEST AREA PILLS:")
+    print(f"{'Idx':<6} {'Area':<8} {'Aspect':<8} {'AreaRatio':<10} {'Stacking':<10} {'OnSide':<8}")
+    print("-" * 65)
+    for p in sorted_by_area[:10]:
+        area_ratio = p['area'] / median_area if median_area > 0 else 0
+        print(f"{p['idx']:<6} {p['area']:<8} {p['aspect']:<8.2f} {area_ratio:<10.2%} {str(p['is_stacking']):<10} {str(p['is_on_side']):<8}")
+    
+    # Sort by overlap (highest first) 
+    sorted_by_overlap = sorted(all_pill_data, key=lambda x: x['overlap'], reverse=True)
+    
+    print(f"\nTOP 10 HIGHEST OVERLAP PILLS:")
+    print(f"{'Idx':<6} {'Overlap':<10} {'Area':<8} {'Aspect':<8} {'Stacking':<10}")
+    print("-" * 55)
+    for p in sorted_by_overlap[:10]:
+        print(f"{p['idx']:<6} {p['overlap']:<10.2%} {p['area']:<8} {p['aspect']:<8.2f} {str(p['is_stacking']):<10}")
+    
+    # Summary of flagged pills
+    stacking_count = sum(1 for p in all_pill_data if p['is_stacking'])
+    on_side_count = sum(1 for p in all_pill_data if p['is_on_side'])
+    blur_count = sum(1 for p in all_pill_data if p['is_blur_outlier'])
+    brightness_count = sum(1 for p in all_pill_data if p['is_brightness_outlier'])
+    motion_count = sum(1 for p in all_pill_data if p['has_motion_blur'])
+    
+    print(f"\n--- FLAGGED PILLS SUMMARY ---")
+    print(f"Total pills: {len(all_pill_data)}")
+    print(f"  Stacking:    {stacking_count} ({100*stacking_count/len(all_pill_data):.1f}%)")
+    print(f"  On-Side:     {on_side_count} ({100*on_side_count/len(all_pill_data):.1f}%)")
+    print(f"  Blur:        {blur_count} ({100*blur_count/len(all_pill_data):.1f}%)")
+    print(f"  Brightness:  {brightness_count} ({100*brightness_count/len(all_pill_data):.1f}%)")
+    print(f"  Motion:      {motion_count} ({100*motion_count/len(all_pill_data):.1f}%)")
+    
+    # Show pills flagged as stacking with their overlap values
+    if stacking_count > 0:
+        print(f"\n  STACKING DETAILS:")
+        stacking_pills = [p for p in all_pill_data if p['is_stacking']]
+        for p in stacking_pills[:10]:
+            print(f"    Pill {p['idx']}: overlap={p['overlap']:.2%}, bbox={p['bbox']}")
+    
+    # Show pills flagged as on-side with their values
+    if on_side_count > 0:
+        print(f"\n  ON-SIDE DETAILS:")
+        on_side_pills = [p for p in all_pill_data if p['is_on_side']]
+        for p in on_side_pills[:10]:
+            area_ratio = p['area'] / median_area if median_area > 0 else 0
+            print(f"    Pill {p['idx']}: aspect={p['aspect']:.2f} (thresh:{aspect_upper_fence:.2f}), area_ratio={area_ratio:.2%}, bbox={p['bbox']}")
+    
+    # Show detection thresholds
+    print(f"\n--- DETECTION THRESHOLDS ---")
+    iqr_area = bbox_stats['q3_area'] - bbox_stats['q1_area']
+    iqr_aspect = bbox_stats['q3_aspect'] - bbox_stats['q1_aspect']
+    print(f"  Stacking: bbox overlap > 20%")
+    print(f"  On-side detection:")
+    print(f"    Area lower fence: {bbox_stats['q1_area'] - 1.5 * iqr_area:.0f} (Q1 - 1.5*IQR)")
+    print(f"    Aspect upper fence: {bbox_stats['q3_aspect'] + 1.5 * iqr_aspect:.2f} (Q3 + 1.5*IQR)")
+    print(f"    Criteria: elongated outlier AND/OR small area outlier")
+    
+    # Analyze sample pills with detailed output
     print(f"\n--- SAMPLE PILL ANALYSIS (first 10) ---")
     
     issues_summary = {
@@ -2154,27 +2152,39 @@ def debug_analyze_image(image_path: str, bbox_path: str, output_dir: str):
         if not isinstance(bbox, tuple) or len(bbox) != 4:
             continue
         
+        x, y, w, h = bbox
+        area = w * h
+        aspect = max(w/h, h/w) if h > 0 and w > 0 else 1.0
+        
         pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
         
+        # Check orientation manually for debug
+        orientation = pill_analyzer.detect_pill_orientation(bbox, bbox_stats)
+        
         issues = []
+        details = []
+        
         if pm.is_stacking:
             issues.append("STACKING")
+            details.append(f"overlap={pm.overlap_ratio:.2f}")
             issues_summary['stacking'] += 1
         if pm.is_on_side:
             issues.append("ON_SIDE")
+            details.append(f"area_ratio={orientation['area_ratio']:.2f}, aspect={aspect:.2f}")
             issues_summary['on_side'] += 1
         if pm.is_blur_outlier:
-            issues.append("BLUR_OUTLIER")
+            issues.append("BLUR")
             issues_summary['blur_outlier'] += 1
         if pm.is_brightness_outlier:
-            issues.append(f"BRIGHT_OUTLIER({pm.brightness_outlier_type})")
+            issues.append(f"BRIGHT({pm.brightness_outlier_type})")
             issues_summary['brightness_outlier'] += 1
         if pm.has_motion_blur:
-            issues.append("MOTION_BLUR")
+            issues.append("MOTION")
             issues_summary['motion_blur'] += 1
         
         status = "⚠️ " + ", ".join(issues) if issues else "✓ OK"
-        print(f"  Pill {i}: bbox={bbox}, lap={pm.laplacian_variance:.1f}, bright={pm.mean_brightness:.1f}, aspect={pm.aspect_ratio:.2f} → {status}")
+        detail_str = f" [{', '.join(details)}]" if details else ""
+        print(f"  Pill {i}: size={w}x{h}, area={area}, aspect={aspect:.2f} → {status}{detail_str}")
     
     # Full analysis
     print(f"\n--- FULL PILL ANALYSIS SUMMARY ---")
@@ -2199,6 +2209,27 @@ def debug_analyze_image(image_path: str, bbox_path: str, output_dir: str):
     # Create debug visualization
     debug_img = image.copy()
     
+    # Add legend at top
+    cv2.rectangle(debug_img, (10, 10), (350, 110), (255, 255, 255), -1)
+    cv2.rectangle(debug_img, (10, 10), (350, 110), (0, 0, 0), 2)
+    cv2.putText(debug_img, "Legend:", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    cv2.circle(debug_img, (30, 55), 8, (0, 255, 0), -1)
+    cv2.putText(debug_img, "OK", (45, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.circle(debug_img, (100, 55), 8, (0, 0, 255), -1)
+    cv2.putText(debug_img, "Stacking", (115, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.circle(debug_img, (200, 55), 8, (255, 0, 255), -1)
+    cv2.putText(debug_img, "On-Side", (215, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.circle(debug_img, (30, 85), 8, (0, 165, 255), -1)
+    cv2.putText(debug_img, "Blur", (45, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.circle(debug_img, (100, 85), 8, (0, 255, 255), -1)
+    cv2.putText(debug_img, "Brightness", (115, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    cv2.circle(debug_img, (200, 85), 8, (255, 165, 0), -1)
+    cv2.putText(debug_img, "Motion", (215, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    # Draw bboxes with issue-specific colors
+    stacking_pills = []
+    on_side_pills = []
+    
     for i, bbox in enumerate(bboxes):
         if not isinstance(bbox, tuple) or len(bbox) != 4:
             continue
@@ -2207,17 +2238,47 @@ def debug_analyze_image(image_path: str, bbox_path: str, output_dir: str):
         
         pm = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
         
-        # Color based on issues
-        if pm.is_stacking or pm.is_on_side:
+        # Determine color and label based on PRIORITY of issues
+        color = (0, 255, 0)  # Default green
+        label = ""
+        thickness = 1
+        
+        if pm.is_stacking:
             color = (0, 0, 255)  # Red
+            label = "STACK"
+            thickness = 3
+            stacking_pills.append((i, bbox, pm.overlap_ratio))
+        elif pm.is_on_side:
+            color = (255, 0, 255)  # Magenta
+            label = "SIDE"
+            thickness = 3
+            on_side_pills.append((i, bbox, pm.aspect_ratio, pm.area_deviation))
         elif pm.is_blur_outlier or pm.has_motion_blur:
             color = (0, 165, 255)  # Orange
+            label = "BLUR" if pm.is_blur_outlier else "MOTION"
+            thickness = 2
         elif pm.is_brightness_outlier:
             color = (0, 255, 255)  # Yellow
-        else:
-            color = (0, 255, 0)  # Green
+            label = pm.brightness_outlier_type[:4].upper()
+            thickness = 2
         
-        cv2.rectangle(debug_img, (x, y), (x+w, y+h), color, 2)
+        cv2.rectangle(debug_img, (x, y), (x+w, y+h), color, thickness)
+        
+        # Add small label
+        if label:
+            cv2.putText(debug_img, label, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    
+    # Print detailed info about flagged pills
+    if stacking_pills:
+        print(f"\n  STACKING PILLS ({len(stacking_pills)}):")
+        for idx, bbox, overlap in stacking_pills[:5]:
+            print(f"    Pill {idx}: bbox={bbox}, overlap={overlap:.2%}")
+    
+    if on_side_pills:
+        print(f"\n  ON-SIDE PILLS ({len(on_side_pills)}):")
+        print(f"    (Reference - median aspect: {bbox_stats.get('median_aspect_ratio', 0):.2f}, q3: {bbox_stats.get('q3_aspect', 0):.2f})")
+        for idx, bbox, aspect, area_dev in on_side_pills[:5]:
+            print(f"    Pill {idx}: bbox={bbox}, aspect={aspect:.2f}, area_dev={area_dev:.2%}")
     
     # Save debug image
     debug_path = os.path.join(output_dir, f"debug_{os.path.basename(image_path)}")
