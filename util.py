@@ -287,13 +287,13 @@ class QualityMetricsComputer:
         
         Motion blur from settling pills causes:
         1. Directional smearing/streaking
-        2. Elongated edges in motion direction
-        3. Reduced sharpness with directional bias
-        4. Ghosting/double edges
+        2. Reduced sharpness with directional bias
+        
+        CONSERVATIVE detection - only flag obvious motion blur.
         
         Returns dict with motion blur indicators.
         """
-        if gray.shape[0] < 10 or gray.shape[1] < 10:
+        if gray.shape[0] < 15 or gray.shape[1] < 15:
             return {'motion_score': 0.0, 'has_motion_blur': False, 'direction': 0.0}
         
         h, w = gray.shape
@@ -310,80 +310,51 @@ class QualityMetricsComputer:
         total_grad = grad_x_energy + grad_y_energy + 1e-10
         grad_anisotropy = abs(grad_x_energy - grad_y_energy) / total_grad
         
-        # 2. Edge spread analysis using Laplacian
-        # Motion blur spreads edges, reducing Laplacian response
+        # 2. Overall sharpness check - motion blur reduces Laplacian
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         laplacian_var = laplacian.var()
         
-        # 3. Streak detection using morphological operations
-        # Motion blur creates elongated structures
+        # 3. Streak detection - look for elongated structures
         edges = cv2.Canny(gray, 50, 150)
         
-        # Check for elongated edge structures (streaks)
         # Use line-shaped kernels to detect directional patterns
         kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
         kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
         
-        # Opening with directional kernels - preserves streaks in that direction
         streaks_h = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_h)
         streaks_v = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_v)
         
-        streak_h_ratio = np.sum(streaks_h > 0) / (edges.size + 1e-10)
-        streak_v_ratio = np.sum(streaks_v > 0) / (edges.size + 1e-10)
-        streak_anisotropy = abs(streak_h_ratio - streak_v_ratio) / (streak_h_ratio + streak_v_ratio + 1e-10)
+        streak_h_count = np.sum(streaks_h > 0)
+        streak_v_count = np.sum(streaks_v > 0)
+        total_edge = np.sum(edges > 0) + 1
         
-        # 4. Double edge / ghosting detection
-        # Motion blur can create parallel edge responses
-        # Use dilated edge comparison
-        kernel_small = np.ones((3, 3), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel_small, iterations=2)
-        edge_spread = np.sum(edges_dilated > 0) / (np.sum(edges > 0) + 1e-10)
+        # Streak ratio - high if edges are mostly in one direction
+        streak_anisotropy = abs(streak_h_count - streak_v_count) / total_edge
         
-        # 5. Frequency domain check - motion blur attenuates high frequencies directionally
-        f = np.fft.fft2(gray.astype(np.float64))
-        fshift = np.fft.fftshift(f)
-        magnitude = np.log1p(np.abs(fshift))
+        # Combined motion score - CONSERVATIVE
+        # Only high gradient anisotropy AND streak anisotropy indicates motion blur
+        motion_score = (grad_anisotropy * 0.5 + streak_anisotropy * 0.5)
         
-        # Check energy distribution in horizontal vs vertical bands
-        center_y, center_x = h // 2, w // 2
-        band_width = min(h, w) // 8
-        
-        # Horizontal band (detects vertical motion blur)
-        h_band = magnitude[center_y - 2:center_y + 2, :]
-        # Vertical band (detects horizontal motion blur)  
-        v_band = magnitude[:, center_x - 2:center_x + 2]
-        
-        h_band_energy = np.mean(h_band) if h_band.size > 0 else 0
-        v_band_energy = np.mean(v_band) if v_band.size > 0 else 0
-        
-        fft_anisotropy = abs(h_band_energy - v_band_energy) / (h_band_energy + v_band_energy + 1e-10)
-        
-        # Combine metrics into motion blur score
-        # Weight factors tuned for pill motion blur detection
-        motion_score = (
-            0.3 * grad_anisotropy +      # Directional gradient weakness
-            0.25 * streak_anisotropy +    # Elongated edge structures
-            0.25 * fft_anisotropy +       # Frequency domain anisotropy
-            0.2 * min(edge_spread / 5.0, 1.0)  # Edge spreading/ghosting
-        )
-        
-        # Determine motion direction
+        # Direction
         if grad_x_energy < grad_y_energy:
-            direction = 0.0  # Horizontal motion (blur in X direction)
+            direction = 0.0  # Horizontal motion
         else:
-            direction = 90.0  # Vertical motion (blur in Y direction)
+            direction = 90.0  # Vertical motion
         
-        # Motion blur threshold - calibrated for pill settling motion
-        # Score > 0.35 suggests significant motion blur
-        has_motion_blur = motion_score > 0.35
+        # VERY CONSERVATIVE threshold - only flag obvious motion blur
+        # Require BOTH high anisotropy AND visible streaking
+        has_motion_blur = (
+            motion_score > 0.6 and  # High overall score
+            grad_anisotropy > 0.4 and  # Strong directional gradient difference
+            streak_anisotropy > 0.3  # Visible streaks
+        )
         
         return {
             'motion_score': float(motion_score),
             'has_motion_blur': has_motion_blur,
             'direction': direction,
             'grad_anisotropy': float(grad_anisotropy),
-            'streak_anisotropy': float(streak_anisotropy),
-            'fft_anisotropy': float(fft_anisotropy)
+            'streak_anisotropy': float(streak_anisotropy)
         }
     
     @staticmethod
@@ -905,20 +876,22 @@ class PillAnalyzer:
         q1_bright = bbox_stats.get('q1_brightness', median_bright * 0.9)
         q3_bright = bbox_stats.get('q3_brightness', median_bright * 1.1)
         
-        if bright_std > 5 and median_bright > 0:  # Only if there's meaningful variation
+        # Only flag if there's meaningful variation AND the pill is a STRONG outlier
+        if bright_std > 10 and median_bright > 0:  # Require more variation
             iqr_bright = q3_bright - q1_bright
-            bright_lower_fence = q1_bright - 1.5 * iqr_bright
-            bright_upper_fence = q3_bright + 1.5 * iqr_bright
             
-            # Z-score
+            # Use 2.5 * IQR for more conservative outlier detection (instead of 1.5)
+            bright_lower_fence = q1_bright - 2.5 * iqr_bright
+            bright_upper_fence = q3_bright + 2.5 * iqr_bright
+            
+            # Z-score must be very high (3+ std devs)
             bright_zscore = abs(metrics.mean_brightness - median_bright) / (bright_std + 1e-10)
             
-            if metrics.mean_brightness < bright_lower_fence or \
-               (bright_zscore > 2.0 and metrics.mean_brightness < median_bright):
+            # BOTH IQR fence AND high z-score required (not OR)
+            if metrics.mean_brightness < bright_lower_fence and bright_zscore > 3.0:
                 metrics.is_brightness_outlier = True
                 metrics.brightness_outlier_type = "underexposed"
-            elif metrics.mean_brightness > bright_upper_fence or \
-                 (bright_zscore > 2.0 and metrics.mean_brightness > median_bright):
+            elif metrics.mean_brightness > bright_upper_fence and bright_zscore > 3.0:
                 metrics.is_brightness_outlier = True
                 metrics.brightness_outlier_type = "overexposed"
         
@@ -927,15 +900,15 @@ class PillAnalyzer:
         motion_std = bbox_stats.get('motion_std', 0)
         q3_motion = bbox_stats.get('q3_motion', median_motion)
         
-        if motion_std > 0.05:  # Only if there's meaningful variation
+        if motion_std > 0.1:  # Only if there's meaningful variation (raised from 0.05)
             iqr_motion = q3_motion - bbox_stats.get('q1_motion', median_motion)
-            motion_upper_fence = q3_motion + 1.5 * iqr_motion
+            motion_upper_fence = q3_motion + 2.5 * iqr_motion  # More conservative (was 1.5)
             
             # Z-score
             motion_zscore = (metrics.motion_blur_score - median_motion) / (motion_std + 1e-10)
             
-            # Flag if significantly more motion blur than siblings
-            if metrics.motion_blur_score > motion_upper_fence or motion_zscore > 2.0:
+            # Flag if significantly more motion blur than siblings - require BOTH conditions
+            if metrics.motion_blur_score > motion_upper_fence and motion_zscore > 3.0:
                 metrics.is_motion_outlier = True
                 # Also set has_motion_blur if detected as outlier
                 if metrics.motion_blur_score > 0.2:  # Lower threshold for outlier-based detection
