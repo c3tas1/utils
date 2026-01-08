@@ -71,6 +71,8 @@ class QualityMetrics:
     saturation_peaks: float = 0.0
     high_saturation_ratio: float = 0.0
     light_blob_score: float = 0.0
+    light_in_pill_region: float = 0.0  # Light affecting pills (bad)
+    light_in_background: float = 0.0   # Light in background only (acceptable)
     
     # Histogram-based metrics
     histogram_entropy: float = 0.0
@@ -92,15 +94,28 @@ class PillMetrics:
     
     # Stacking detection
     overlap_ratio: float = 0.0
+    is_stacking: bool = False  # True only for actual vertical stacking
     aspect_ratio: float = 0.0
+    
+    # Pill orientation detection (side vs flat)
+    is_on_side: bool = False  # True if pill is on its edge instead of flat
+    orientation_score: float = 0.0  # Higher = more likely on side
+    edge_thickness_ratio: float = 0.0  # Thin profile suggests side placement
     area_deviation: float = 0.0  # deviation from median pill area
     
     # Edge quality
     edge_density: float = 0.0
     edge_continuity: float = 0.0
     
-    # Motion blur
+    # Motion blur (pill still settling/moving when captured)
     motion_blur_score: float = 0.0
+    has_motion_blur: bool = False
+    
+    # Same-image outlier detection flags
+    is_blur_outlier: bool = False  # Blurrier than siblings in same image
+    is_brightness_outlier: bool = False  # Brighter/dimmer than siblings
+    brightness_outlier_type: str = ""  # "overexposed" or "underexposed"
+    is_motion_outlier: bool = False  # More motion blur than siblings
     
     # Issues identified
     issues: List[str] = field(default_factory=list)
@@ -233,57 +248,143 @@ class QualityMetricsComputer:
     @staticmethod
     def compute_motion_blur_metrics(gray: np.ndarray) -> Tuple[float, float]:
         """
-        Detect motion blur using directional FFT analysis.
+        Detect global motion blur using directional FFT analysis.
+        Note: For pill-specific motion blur (settling pills), use compute_pill_motion_blur instead.
         Returns (motion_blur_score, dominant_angle).
         """
+        # Simplified global motion blur - less aggressive
         rows, cols = gray.shape
         
-        # Compute FFT magnitude spectrum
+        # Compute gradient magnitudes in different directions
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # If blur is directional, gradients will be weak in blur direction
+        gx_energy = np.mean(np.abs(gx))
+        gy_energy = np.mean(np.abs(gy))
+        
+        # Anisotropy in gradients suggests directional blur
+        max_energy = max(gx_energy, gy_energy)
+        min_energy = min(gx_energy, gy_energy)
+        
+        if max_energy > 0:
+            anisotropy = (max_energy - min_energy) / (max_energy + 1e-10)
+        else:
+            anisotropy = 0.0
+        
+        # Determine dominant angle (0 = horizontal blur, 90 = vertical blur)
+        if gx_energy < gy_energy:
+            dominant_angle = 0.0  # Horizontal motion blur (weak horizontal edges)
+        else:
+            dominant_angle = 90.0  # Vertical motion blur
+        
+        return float(anisotropy), float(dominant_angle)
+    
+    @staticmethod
+    def compute_pill_motion_blur(gray: np.ndarray) -> Dict[str, float]:
+        """
+        Detect motion blur on individual pill crops.
+        
+        Motion blur from settling pills causes:
+        1. Directional smearing/streaking
+        2. Elongated edges in motion direction
+        3. Reduced sharpness with directional bias
+        4. Ghosting/double edges
+        
+        Returns dict with motion blur indicators.
+        """
+        if gray.shape[0] < 10 or gray.shape[1] < 10:
+            return {'motion_score': 0.0, 'has_motion_blur': False, 'direction': 0.0}
+        
+        h, w = gray.shape
+        
+        # 1. Directional gradient analysis
+        # Motion blur causes weak gradients in motion direction, strong perpendicular
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        grad_x_energy = np.mean(np.abs(sobel_x))
+        grad_y_energy = np.mean(np.abs(sobel_y))
+        
+        # Gradient anisotropy - high value means directional blur
+        total_grad = grad_x_energy + grad_y_energy + 1e-10
+        grad_anisotropy = abs(grad_x_energy - grad_y_energy) / total_grad
+        
+        # 2. Edge spread analysis using Laplacian
+        # Motion blur spreads edges, reducing Laplacian response
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian_var = laplacian.var()
+        
+        # 3. Streak detection using morphological operations
+        # Motion blur creates elongated structures
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Check for elongated edge structures (streaks)
+        # Use line-shaped kernels to detect directional patterns
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+        
+        # Opening with directional kernels - preserves streaks in that direction
+        streaks_h = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_h)
+        streaks_v = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_v)
+        
+        streak_h_ratio = np.sum(streaks_h > 0) / (edges.size + 1e-10)
+        streak_v_ratio = np.sum(streaks_v > 0) / (edges.size + 1e-10)
+        streak_anisotropy = abs(streak_h_ratio - streak_v_ratio) / (streak_h_ratio + streak_v_ratio + 1e-10)
+        
+        # 4. Double edge / ghosting detection
+        # Motion blur can create parallel edge responses
+        # Use dilated edge comparison
+        kernel_small = np.ones((3, 3), np.uint8)
+        edges_dilated = cv2.dilate(edges, kernel_small, iterations=2)
+        edge_spread = np.sum(edges_dilated > 0) / (np.sum(edges > 0) + 1e-10)
+        
+        # 5. Frequency domain check - motion blur attenuates high frequencies directionally
         f = np.fft.fft2(gray.astype(np.float64))
         fshift = np.fft.fftshift(f)
         magnitude = np.log1p(np.abs(fshift))
         
-        # Analyze directional energy
-        center = (rows // 2, cols // 2)
-        angles = np.linspace(0, 180, 36)  # 5-degree increments
-        directional_energy = []
+        # Check energy distribution in horizontal vs vertical bands
+        center_y, center_x = h // 2, w // 2
+        band_width = min(h, w) // 8
         
-        for angle in angles:
-            # Create line mask at this angle
-            mask = np.zeros((rows, cols), dtype=np.float64)
-            length = min(rows, cols) // 2
-            
-            rad = np.radians(angle)
-            for r in range(-length, length):
-                x = int(center[1] + r * np.cos(rad))
-                y = int(center[0] + r * np.sin(rad))
-                if 0 <= x < cols and 0 <= y < rows:
-                    # Use a thick line for robustness
-                    for dx in range(-2, 3):
-                        for dy in range(-2, 3):
-                            nx, ny = x + dx, y + dy
-                            if 0 <= nx < cols and 0 <= ny < rows:
-                                mask[ny, nx] = 1.0
-            
-            energy = np.sum(magnitude * mask) / (np.sum(mask) + 1e-10)
-            directional_energy.append(energy)
+        # Horizontal band (detects vertical motion blur)
+        h_band = magnitude[center_y - 2:center_y + 2, :]
+        # Vertical band (detects horizontal motion blur)  
+        v_band = magnitude[:, center_x - 2:center_x + 2]
         
-        directional_energy = np.array(directional_energy)
+        h_band_energy = np.mean(h_band) if h_band.size > 0 else 0
+        v_band_energy = np.mean(v_band) if v_band.size > 0 else 0
         
-        # Motion blur creates a strong line in FFT perpendicular to motion
-        max_energy = np.max(directional_energy)
-        min_energy = np.min(directional_energy)
-        mean_energy = np.mean(directional_energy)
+        fft_anisotropy = abs(h_band_energy - v_band_energy) / (h_band_energy + v_band_energy + 1e-10)
         
-        # Anisotropy ratio indicates motion blur
-        if mean_energy > 0:
-            anisotropy = (max_energy - min_energy) / (mean_energy + 1e-10)
+        # Combine metrics into motion blur score
+        # Weight factors tuned for pill motion blur detection
+        motion_score = (
+            0.3 * grad_anisotropy +      # Directional gradient weakness
+            0.25 * streak_anisotropy +    # Elongated edge structures
+            0.25 * fft_anisotropy +       # Frequency domain anisotropy
+            0.2 * min(edge_spread / 5.0, 1.0)  # Edge spreading/ghosting
+        )
+        
+        # Determine motion direction
+        if grad_x_energy < grad_y_energy:
+            direction = 0.0  # Horizontal motion (blur in X direction)
         else:
-            anisotropy = 0.0
+            direction = 90.0  # Vertical motion (blur in Y direction)
         
-        dominant_angle = angles[np.argmax(directional_energy)]
+        # Motion blur threshold - calibrated for pill settling motion
+        # Score > 0.35 suggests significant motion blur
+        has_motion_blur = motion_score > 0.35
         
-        return float(anisotropy), float(dominant_angle)
+        return {
+            'motion_score': float(motion_score),
+            'has_motion_blur': has_motion_blur,
+            'direction': direction,
+            'grad_anisotropy': float(grad_anisotropy),
+            'streak_anisotropy': float(streak_anisotropy),
+            'fft_anisotropy': float(fft_anisotropy)
+        }
     
     @staticmethod
     def compute_brightness_metrics(gray: np.ndarray) -> Dict[str, float]:
@@ -385,52 +486,140 @@ class QualityMetricsComputer:
         }
     
     @staticmethod
-    def compute_light_intrusion_metrics(image: np.ndarray) -> Dict[str, float]:
+    def compute_light_intrusion_metrics(image: np.ndarray, 
+                                        bboxes: List[Tuple[int, int, int, int]] = None) -> Dict[str, float]:
         """
-        Detect external light intrusion using saturation and blob analysis.
+        Detect external light intrusion that affects PILL REGIONS.
+        
+        Light in background (non-pill areas) is acceptable.
+        Only flag light intrusion if it's in/near pill bounding boxes.
+        
+        Args:
+            image: Full image (BGR or grayscale)
+            bboxes: List of pill bounding boxes (x, y, w, h). If provided,
+                   only analyzes light intrusion in pill regions.
+        
+        Returns:
+            Dict with light intrusion metrics
         """
         # Convert to HSV
         if len(image.shape) == 2:
-            # Grayscale - limited analysis
             gray = image
             hsv = None
         else:
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
+        img_h, img_w = gray.shape[:2]
+        
         results = {
             'saturation_peaks': 0.0,
             'high_saturation_ratio': 0.0,
-            'light_blob_score': 0.0
+            'light_blob_score': 0.0,
+            'light_in_pill_region': 0.0,  # NEW: light specifically affecting pills
+            'light_in_background': 0.0,   # NEW: light in background (acceptable)
         }
         
-        if hsv is not None:
-            saturation = hsv[:, :, 1]
-            value = hsv[:, :, 2]
-            
-            # High saturation with high value often indicates external light
-            high_sat_mask = (saturation > 150) & (value > 200)
-            results['high_saturation_ratio'] = float(np.sum(high_sat_mask) / saturation.size)
-            
-            # Peak saturation regions
-            results['saturation_peaks'] = float(np.percentile(saturation, 99) / 255.0)
+        # Create pill region mask if bboxes provided
+        pill_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        if bboxes:
+            for bbox in bboxes:
+                if isinstance(bbox, tuple) and len(bbox) == 4:
+                    x, y, w, h = bbox
+                    # Expand bbox slightly to catch light bleeding onto pills
+                    expand = 5
+                    x1 = max(0, int(x) - expand)
+                    y1 = max(0, int(y) - expand)
+                    x2 = min(img_w, int(x + w) + expand)
+                    y2 = min(img_h, int(y + h) + expand)
+                    pill_mask[y1:y2, x1:x2] = 255
         
-        # Detect bright blobs that might be light intrusion
+        background_mask = cv2.bitwise_not(pill_mask) if bboxes else None
+        
+        # Detect bright blobs (potential light intrusion)
         _, bright_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
         
         # Find contours of bright regions
         contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        total_light_area = 0
+        light_in_pill_area = 0
+        light_in_background_area = 0
+        
         if contours:
-            # Calculate total area of bright blobs
-            total_blob_area = sum(cv2.contourArea(c) for c in contours)
-            results['light_blob_score'] = float(total_blob_area / gray.size)
+            for contour in contours:
+                contour_area = cv2.contourArea(contour)
+                if contour_area < 50:  # Skip tiny bright spots (noise)
+                    continue
+                
+                total_light_area += contour_area
+                
+                if bboxes and pill_mask is not None:
+                    # Create mask for this contour
+                    contour_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                    cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+                    
+                    # Check overlap with pill regions
+                    overlap_with_pills = cv2.bitwise_and(contour_mask, pill_mask)
+                    overlap_area = np.sum(overlap_with_pills > 0)
+                    
+                    light_in_pill_area += overlap_area
+                    light_in_background_area += (contour_area - overlap_area)
+        
+        # Calculate ratios
+        if bboxes:
+            pill_region_area = np.sum(pill_mask > 0)
+            background_area = img_h * img_w - pill_region_area
+            
+            # Light in pill region ratio (THIS IS THE PROBLEM)
+            if pill_region_area > 0:
+                results['light_in_pill_region'] = float(light_in_pill_area / pill_region_area)
+            
+            # Light in background ratio (this is OK)
+            if background_area > 0:
+                results['light_in_background'] = float(light_in_background_area / background_area)
+            
+            # Overall light blob score - ONLY count light affecting pills
+            results['light_blob_score'] = results['light_in_pill_region']
+        else:
+            # No bboxes provided - use total light area (old behavior)
+            results['light_blob_score'] = float(total_light_area / gray.size)
+        
+        # Saturation analysis (for color images)
+        if hsv is not None:
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+            
+            # High saturation with high value often indicates external light
+            high_sat_high_val = (saturation > 150) & (value > 200)
+            
+            if bboxes and pill_mask is not None:
+                # Only count high saturation IN pill regions
+                high_sat_in_pills = high_sat_high_val & (pill_mask > 0)
+                pill_pixels = np.sum(pill_mask > 0)
+                if pill_pixels > 0:
+                    results['high_saturation_ratio'] = float(np.sum(high_sat_in_pills) / pill_pixels)
+            else:
+                results['high_saturation_ratio'] = float(np.sum(high_sat_high_val) / saturation.size)
+            
+            # Peak saturation in pill regions only
+            if bboxes and pill_mask is not None:
+                pill_saturation = saturation[pill_mask > 0]
+                if pill_saturation.size > 0:
+                    results['saturation_peaks'] = float(np.percentile(pill_saturation, 99) / 255.0)
+            else:
+                results['saturation_peaks'] = float(np.percentile(saturation, 99) / 255.0)
         
         return results
     
-    def compute_all_metrics(self, image: np.ndarray) -> QualityMetrics:
+    def compute_all_metrics(self, image: np.ndarray, 
+                            bboxes: List[Tuple[int, int, int, int]] = None) -> QualityMetrics:
         """
         Compute all quality metrics for an image.
+        
+        Args:
+            image: Input image (BGR or grayscale)
+            bboxes: Optional list of pill bounding boxes for targeted analysis
         """
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -470,11 +659,13 @@ class QualityMetricsComputer:
         metrics.brightness_uniformity = uniformity['brightness_uniformity']
         metrics.blur_uniformity = uniformity['blur_uniformity']
         
-        # Light intrusion
-        light = self.compute_light_intrusion_metrics(image)
+        # Light intrusion - pass bboxes to only flag light affecting pills
+        light = self.compute_light_intrusion_metrics(image, bboxes)
         metrics.saturation_peaks = light['saturation_peaks']
         metrics.high_saturation_ratio = light['high_saturation_ratio']
         metrics.light_blob_score = light['light_blob_score']
+        metrics.light_in_pill_region = light.get('light_in_pill_region', 0.0)
+        metrics.light_in_background = light.get('light_in_background', 0.0)
         
         return metrics
 
@@ -489,22 +680,206 @@ class PillAnalyzer:
     def __init__(self):
         self.metrics_computer = QualityMetricsComputer()
     
-    def compute_overlap_ratio(self, bbox: Tuple[int, int, int, int], 
-                             all_bboxes: List[Tuple[int, int, int, int]]) -> float:
+    def detect_pill_on_side(self, gray: np.ndarray, bbox: Tuple[int, int, int, int],
+                           all_bbox_stats: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Compute IoU-based overlap ratio with other bboxes.
-        High overlap suggests stacking.
+        Detect if a pill is placed on its side (edge-on) instead of flat.
+        
+        Compares this pill against OTHER pills in the SAME image to find outliers.
+        Since most pills are flat, the median/majority represents the "normal" flat orientation.
+        Pills on side will be statistical outliers.
+        
+        Args:
+            gray: Grayscale pill crop
+            bbox: Bounding box (x, y, w, h)
+            all_bbox_stats: Statistics from all bboxes in this image:
+                - median_area: median pill area
+                - median_aspect_ratio: median aspect ratio  
+                - aspect_ratio_std: standard deviation of aspect ratios
+                - area_std: standard deviation of areas
+                - q1_area, q3_area: quartiles for area
+                - q1_aspect, q3_aspect: quartiles for aspect ratio
+            
+        Returns:
+            Dict with orientation detection results
+        """
+        x, y, w, h = bbox
+        area = w * h
+        aspect_ratio = w / h if h > 0 else 1.0
+        
+        # Normalize aspect ratio to always be >= 1 (longer dimension / shorter)
+        norm_aspect = max(aspect_ratio, 1.0 / aspect_ratio) if aspect_ratio > 0 else 1.0
+        
+        median_area = all_bbox_stats.get('median_area', area)
+        median_aspect = all_bbox_stats.get('median_aspect_ratio', 1.0)
+        median_norm_aspect = max(median_aspect, 1.0 / median_aspect) if median_aspect > 0 else 1.0
+        
+        aspect_std = all_bbox_stats.get('aspect_ratio_std', 0.5)
+        area_std = all_bbox_stats.get('area_std', median_area * 0.3)
+        
+        q1_area = all_bbox_stats.get('q1_area', median_area * 0.7)
+        q3_area = all_bbox_stats.get('q3_area', median_area * 1.3)
+        q1_aspect = all_bbox_stats.get('q1_aspect', median_norm_aspect * 0.8)
+        q3_aspect = all_bbox_stats.get('q3_aspect', median_norm_aspect * 1.2)
+        
+        is_on_side = False
+        orientation_score = 0.0
+        reasons = []
+        
+        # === Check 1: Statistical outlier detection using IQR method ===
+        # Pills on side will be outliers in aspect ratio AND/OR area
+        
+        # IQR for aspect ratio
+        iqr_aspect = q3_aspect - q1_aspect
+        aspect_upper_fence = q3_aspect + 1.5 * iqr_aspect
+        
+        # IQR for area  
+        iqr_area = q3_area - q1_area
+        area_lower_fence = q1_area - 1.5 * iqr_area
+        
+        # Check if this pill is an outlier
+        is_aspect_outlier = norm_aspect > aspect_upper_fence and iqr_aspect > 0.1
+        is_area_outlier = area < area_lower_fence and iqr_area > 100
+        
+        if is_aspect_outlier:
+            orientation_score += 0.35
+            reasons.append(f"aspect_ratio_outlier_{norm_aspect:.2f}_vs_median_{median_norm_aspect:.2f}")
+        
+        if is_area_outlier:
+            orientation_score += 0.3
+            reasons.append(f"area_outlier_{area}_vs_median_{median_area:.0f}")
+        
+        # === Check 2: Z-score based detection ===
+        # How many standard deviations away from the mean?
+        
+        if aspect_std > 0.05:
+            aspect_zscore = (norm_aspect - median_norm_aspect) / aspect_std
+            if aspect_zscore > 2.0:  # More than 2 std devs above median
+                orientation_score += 0.25
+                reasons.append(f"aspect_zscore_{aspect_zscore:.2f}")
+        
+        if area_std > 50 and median_area > 0:
+            area_zscore = (median_area - area) / area_std  # Negative because smaller is suspicious
+            if area_zscore > 2.0:  # More than 2 std devs below median
+                orientation_score += 0.2
+                reasons.append(f"area_zscore_{area_zscore:.2f}")
+        
+        # === Check 3: Combined ratio check ===
+        # Pills on side: much higher aspect ratio AND much smaller area simultaneously
+        
+        if median_area > 0 and median_norm_aspect > 0:
+            area_ratio = area / median_area
+            aspect_deviation = norm_aspect / median_norm_aspect
+            
+            # Strong indicator: elongated AND small
+            if aspect_deviation > 1.5 and area_ratio < 0.6:
+                orientation_score += 0.3
+                reasons.append("elongated_and_small")
+            elif aspect_deviation > 1.3 and area_ratio < 0.7:
+                orientation_score += 0.15
+                reasons.append("moderately_elongated_and_reduced_area")
+        
+        # === Check 4: Edge profile analysis (only if other checks suggest on-side) ===
+        # This is more expensive, so only run if we have initial suspicion
+        
+        if orientation_score >= 0.2 and gray.shape[0] > 10 and gray.shape[1] > 10:
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Detect strong parallel lines (characteristic of side-placed pills)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=15,
+                                    minLineLength=min(w, h) * 0.4,
+                                    maxLineGap=5)
+            
+            if lines is not None and len(lines) >= 2:
+                # Analyze line orientations
+                horizontal_lines = 0
+                vertical_lines = 0
+                
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+                    
+                    if length > min(w, h) * 0.3:
+                        angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+                        if angle < 25 or angle > 155:  # Near horizontal
+                            horizontal_lines += 1
+                        elif 65 < angle < 115:  # Near vertical
+                            vertical_lines += 1
+                
+                # Pills on side have strong parallel edges along one axis
+                if horizontal_lines >= 2 or vertical_lines >= 2:
+                    dominant_lines = max(horizontal_lines, vertical_lines)
+                    if dominant_lines >= 2:
+                        orientation_score += 0.15
+                        reasons.append(f"parallel_edges_{dominant_lines}_lines")
+            
+            # Rectangularity check
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                contour_area = cv2.contourArea(largest_contour)
+                
+                if contour_area > 100 and len(largest_contour) >= 5:
+                    rect = cv2.minAreaRect(largest_contour)
+                    rect_area = rect[1][0] * rect[1][1]
+                    
+                    # High rectangularity suggests side placement
+                    rectangularity = contour_area / (rect_area + 1e-10)
+                    if rectangularity > 0.88:
+                        orientation_score += 0.1
+                        reasons.append(f"rectangular_profile_{rectangularity:.2f}")
+        
+        # === Final determination ===
+        # Require sufficient evidence before flagging
+        if orientation_score >= 0.5:
+            is_on_side = True
+        
+        # Edge thickness ratio
+        edge_thickness_ratio = min(w, h) / max(w, h) if max(w, h) > 0 else 1.0
+        
+        return {
+            'is_on_side': is_on_side,
+            'orientation_score': orientation_score,
+            'edge_thickness_ratio': edge_thickness_ratio,
+            'normalized_aspect_ratio': norm_aspect,
+            'reasons': reasons
+        }
+    
+    def compute_overlap_ratio(self, bbox: Tuple[int, int, int, int], 
+                             all_bboxes: List[Tuple[int, int, int, int]]) -> Tuple[float, bool]:
+        """
+        Compute overlap ratio with other bboxes to detect TRUE stacking.
+        
+        Stacking = one pill physically on top of another (significant area overlap)
+        NOT stacking = pills placed side by side (edge touching only)
+        
+        Returns:
+            (overlap_ratio, is_true_stacking)
         """
         x1, y1, w1, h1 = bbox
         box1_area = w1 * h1
         
+        if box1_area == 0:
+            return 0.0, False
+        
         max_overlap = 0.0
+        is_stacking = False
+        
+        # Minimum overlap threshold to be considered stacking
+        # Pills side-by-side might have tiny edge overlaps due to bbox inaccuracy
+        MIN_STACKING_OVERLAP = 0.15  # At least 15% of pill area overlapping
         
         for other in all_bboxes:
             if other == bbox:
                 continue
             
             x2, y2, w2, h2 = other
+            box2_area = w2 * h2
+            
+            if box2_area == 0:
+                continue
             
             # Compute intersection
             ix1 = max(x1, x2)
@@ -513,18 +888,49 @@ class PillAnalyzer:
             iy2 = min(y1 + h1, y2 + h2)
             
             if ix2 > ix1 and iy2 > iy1:
-                intersection = (ix2 - ix1) * (iy2 - iy1)
-                # Use overlap ratio relative to current box
-                overlap = intersection / box1_area
-                max_overlap = max(max_overlap, overlap)
+                intersection_w = ix2 - ix1
+                intersection_h = iy2 - iy1
+                intersection_area = intersection_w * intersection_h
+                
+                # Overlap relative to smaller box (more sensitive to stacking)
+                smaller_area = min(box1_area, box2_area)
+                overlap_ratio = intersection_area / smaller_area
+                
+                # Check if this is TRUE stacking vs edge touching
+                # True stacking: significant overlap in BOTH dimensions
+                # Edge touching: overlap is thin strip along one edge
+                
+                # Calculate what fraction of each dimension is overlapping
+                overlap_w_ratio = intersection_w / min(w1, w2)
+                overlap_h_ratio = intersection_h / min(h1, h2)
+                
+                # True stacking requires substantial overlap in both dimensions
+                # (not just a thin sliver along an edge)
+                is_substantial_2d_overlap = (overlap_w_ratio > 0.3 and overlap_h_ratio > 0.3)
+                
+                if overlap_ratio > max_overlap:
+                    max_overlap = overlap_ratio
+                
+                # Only flag as stacking if:
+                # 1. Significant area overlap (>15%)
+                # 2. Overlap is substantial in both dimensions (not edge touching)
+                if overlap_ratio > MIN_STACKING_OVERLAP and is_substantial_2d_overlap:
+                    is_stacking = True
         
-        return max_overlap
+        return max_overlap, is_stacking
     
     def analyze_pill(self, image: np.ndarray, bbox: Tuple[int, int, int, int],
                     bbox_id: int, all_bboxes: List[Tuple[int, int, int, int]],
-                    median_area: float) -> PillMetrics:
+                    bbox_stats: Dict[str, Any]) -> PillMetrics:
         """
         Analyze a single pill crop.
+        
+        Args:
+            image: Full image
+            bbox: This pill's bounding box (x, y, w, h)
+            bbox_id: Index of this bbox
+            all_bboxes: All bboxes in this image (for overlap detection)
+            bbox_stats: Statistics from all bboxes for outlier detection
         """
         x, y, w, h = bbox
         
@@ -556,13 +962,23 @@ class PillAnalyzer:
         metrics.overexposed_ratio = float(np.sum(gray > 250) / gray.size)
         metrics.underexposed_ratio = float(np.sum(gray < 5) / gray.size)
         
-        # Stacking detection
-        metrics.overlap_ratio = self.compute_overlap_ratio(bbox, all_bboxes)
-        metrics.aspect_ratio = w / h if h > 0 else 0
+        # Stacking detection - now returns (overlap_ratio, is_true_stacking)
+        overlap_ratio, is_stacking = self.compute_overlap_ratio(bbox, all_bboxes)
+        metrics.overlap_ratio = overlap_ratio
+        metrics.is_stacking = is_stacking
         
+        # Aspect ratio and area deviation
+        metrics.aspect_ratio = w / h if h > 0 else 0
         area = w * h
+        median_area = bbox_stats.get('median_area', area)
         if median_area > 0:
             metrics.area_deviation = abs(area - median_area) / median_area
+        
+        # Pill orientation detection (on side vs flat) - uses statistical comparison
+        orientation = self.detect_pill_on_side(gray, bbox, bbox_stats)
+        metrics.is_on_side = orientation['is_on_side']
+        metrics.orientation_score = orientation['orientation_score']
+        metrics.edge_thickness_ratio = orientation['edge_thickness_ratio']
         
         # Edge analysis for partial occlusion detection
         edges = cv2.Canny(gray, 50, 150)
@@ -575,10 +991,77 @@ class PillAnalyzer:
             contour_area = cv2.contourArea(largest_contour)
             metrics.edge_continuity = contour_area / (w * h) if w * h > 0 else 0
         
-        # Motion blur for this pill
+        # Motion blur for this pill - detect settling motion
         if gray.shape[0] > 10 and gray.shape[1] > 10:
-            motion_score, _ = self.metrics_computer.compute_motion_blur_metrics(gray)
-            metrics.motion_blur_score = motion_score
+            motion_result = self.metrics_computer.compute_pill_motion_blur(gray)
+            metrics.motion_blur_score = motion_result['motion_score']
+            metrics.has_motion_blur = motion_result['has_motion_blur']
+        else:
+            metrics.motion_blur_score = 0.0
+            metrics.has_motion_blur = False
+        
+        # === SAME-IMAGE OUTLIER DETECTION ===
+        # Compare this pill against its siblings in the same image
+        # A pill with issues will be an outlier compared to the majority
+        
+        # Blur outlier detection (this pill blurrier than siblings)
+        median_lap = bbox_stats.get('median_laplacian', metrics.laplacian_variance)
+        lap_std = bbox_stats.get('laplacian_std', 0)
+        q1_lap = bbox_stats.get('q1_laplacian', median_lap)
+        
+        if lap_std > 10 and median_lap > 0:  # Only if there's meaningful variation
+            # IQR method
+            iqr_lap = bbox_stats.get('q3_laplacian', median_lap) - q1_lap
+            blur_lower_fence = q1_lap - 1.5 * iqr_lap
+            
+            # Z-score method
+            lap_zscore = (median_lap - metrics.laplacian_variance) / (lap_std + 1e-10)
+            
+            # Flag if significantly blurrier than siblings
+            if metrics.laplacian_variance < blur_lower_fence or lap_zscore > 2.0:
+                metrics.is_blur_outlier = True
+        
+        # Brightness outlier detection (this pill over/under exposed vs siblings)
+        median_bright = bbox_stats.get('median_brightness', metrics.mean_brightness)
+        bright_std = bbox_stats.get('brightness_std', 0)
+        q1_bright = bbox_stats.get('q1_brightness', median_bright * 0.9)
+        q3_bright = bbox_stats.get('q3_brightness', median_bright * 1.1)
+        
+        if bright_std > 5 and median_bright > 0:  # Only if there's meaningful variation
+            iqr_bright = q3_bright - q1_bright
+            bright_lower_fence = q1_bright - 1.5 * iqr_bright
+            bright_upper_fence = q3_bright + 1.5 * iqr_bright
+            
+            # Z-score
+            bright_zscore = abs(metrics.mean_brightness - median_bright) / (bright_std + 1e-10)
+            
+            if metrics.mean_brightness < bright_lower_fence or \
+               (bright_zscore > 2.0 and metrics.mean_brightness < median_bright):
+                metrics.is_brightness_outlier = True
+                metrics.brightness_outlier_type = "underexposed"
+            elif metrics.mean_brightness > bright_upper_fence or \
+                 (bright_zscore > 2.0 and metrics.mean_brightness > median_bright):
+                metrics.is_brightness_outlier = True
+                metrics.brightness_outlier_type = "overexposed"
+        
+        # Motion blur outlier detection (this pill has motion blur while siblings don't)
+        median_motion = bbox_stats.get('median_motion', 0)
+        motion_std = bbox_stats.get('motion_std', 0)
+        q3_motion = bbox_stats.get('q3_motion', median_motion)
+        
+        if motion_std > 0.05:  # Only if there's meaningful variation
+            iqr_motion = q3_motion - bbox_stats.get('q1_motion', median_motion)
+            motion_upper_fence = q3_motion + 1.5 * iqr_motion
+            
+            # Z-score
+            motion_zscore = (metrics.motion_blur_score - median_motion) / (motion_std + 1e-10)
+            
+            # Flag if significantly more motion blur than siblings
+            if metrics.motion_blur_score > motion_upper_fence or motion_zscore > 2.0:
+                metrics.is_motion_outlier = True
+                # Also set has_motion_blur if detected as outlier
+                if metrics.motion_blur_score > 0.2:  # Lower threshold for outlier-based detection
+                    metrics.has_motion_blur = True
         
         return metrics
 
@@ -761,22 +1244,116 @@ def analyze_single_image(args: Tuple[str, str, Optional[CalibrationThresholds]])
         bboxes = load_bboxes(bbox_path)
         bboxes = convert_yolo_bboxes(bboxes, img_width, img_height)
         
-        # Compute image-level metrics
+        # Compute image-level metrics (pass bboxes for targeted light intrusion detection)
         metrics_computer = QualityMetricsComputer()
-        image_metrics = metrics_computer.compute_all_metrics(image)
+        image_metrics = metrics_computer.compute_all_metrics(image, bboxes)
         
         # Compute pill-level metrics
         pill_analyzer = PillAnalyzer()
         pill_metrics_list = []
         
         if bboxes:
-            areas = [w * h for x, y, w, h in bboxes if isinstance((x, y, w, h), tuple)]
-            median_area = np.median(areas) if areas else 0
+            # Compute comprehensive statistics from all bboxes for outlier detection
+            valid_bboxes = [(x, y, w, h) for x, y, w, h in bboxes 
+                           if isinstance((x, y, w, h), tuple) and h > 0 and w > 0]
             
+            if valid_bboxes:
+                areas = [w * h for x, y, w, h in valid_bboxes]
+                aspect_ratios = [w / h for x, y, w, h in valid_bboxes]
+                # Normalize aspect ratios to always be >= 1
+                norm_aspects = [max(ar, 1.0/ar) if ar > 0 else 1.0 for ar in aspect_ratios]
+                
+                # Compute statistics for outlier detection
+                bbox_stats = {
+                    'median_area': float(np.median(areas)),
+                    'mean_area': float(np.mean(areas)),
+                    'area_std': float(np.std(areas)),
+                    'q1_area': float(np.percentile(areas, 25)),
+                    'q3_area': float(np.percentile(areas, 75)),
+                    'median_aspect_ratio': float(np.median(norm_aspects)),
+                    'mean_aspect_ratio': float(np.mean(norm_aspects)),
+                    'aspect_ratio_std': float(np.std(norm_aspects)),
+                    'q1_aspect': float(np.percentile(norm_aspects, 25)),
+                    'q3_aspect': float(np.percentile(norm_aspects, 75)),
+                    'num_pills': len(valid_bboxes)
+                }
+            else:
+                bbox_stats = {
+                    'median_area': 0, 'mean_area': 0, 'area_std': 0,
+                    'q1_area': 0, 'q3_area': 0,
+                    'median_aspect_ratio': 1.0, 'mean_aspect_ratio': 1.0,
+                    'aspect_ratio_std': 0, 'q1_aspect': 1.0, 'q3_aspect': 1.0,
+                    'num_pills': 0
+                }
+            
+            # FIRST PASS: Collect blur and brightness metrics from all pills
+            # Need this for same-image comparison (outlier detection)
+            first_pass_metrics = []
             for i, bbox in enumerate(bboxes):
                 if not isinstance(bbox, tuple) or len(bbox) != 4:
                     continue
-                pill_metrics = pill_analyzer.analyze_pill(image, bbox, i, bboxes, median_area)
+                x, y, w, h = bbox
+                img_h, img_w = image.shape[:2]
+                x, y = max(0, x), max(0, y)
+                w, h = min(w, img_w - x), min(h, img_h - y)
+                
+                if w > 0 and h > 0:
+                    crop = image[y:y+h, x:x+w]
+                    if len(crop.shape) == 3:
+                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    else:
+                        gray = crop
+                    
+                    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    brightness = float(np.mean(gray))
+                    
+                    # Quick motion blur check
+                    if gray.shape[0] > 10 and gray.shape[1] > 10:
+                        motion_result = pill_analyzer.metrics_computer.compute_pill_motion_blur(gray)
+                        motion_score = motion_result['motion_score']
+                    else:
+                        motion_score = 0.0
+                    
+                    first_pass_metrics.append({
+                        'laplacian': lap_var,
+                        'brightness': brightness,
+                        'motion_score': motion_score
+                    })
+            
+            # Compute same-image statistics for blur, brightness, motion
+            if first_pass_metrics:
+                lap_values = [m['laplacian'] for m in first_pass_metrics]
+                bright_values = [m['brightness'] for m in first_pass_metrics]
+                motion_values = [m['motion_score'] for m in first_pass_metrics]
+                
+                bbox_stats.update({
+                    # Blur statistics (for detecting blurry pills vs sharp siblings)
+                    'median_laplacian': float(np.median(lap_values)),
+                    'mean_laplacian': float(np.mean(lap_values)),
+                    'laplacian_std': float(np.std(lap_values)),
+                    'q1_laplacian': float(np.percentile(lap_values, 25)),
+                    'q3_laplacian': float(np.percentile(lap_values, 75)),
+                    
+                    # Brightness statistics (for detecting over/under exposed pills)
+                    'median_brightness': float(np.median(bright_values)),
+                    'mean_brightness': float(np.mean(bright_values)),
+                    'brightness_std': float(np.std(bright_values)),
+                    'q1_brightness': float(np.percentile(bright_values, 25)),
+                    'q3_brightness': float(np.percentile(bright_values, 75)),
+                    
+                    # Motion blur statistics (for detecting pills still settling)
+                    'median_motion': float(np.median(motion_values)),
+                    'mean_motion': float(np.mean(motion_values)),
+                    'motion_std': float(np.std(motion_values)),
+                    'q1_motion': float(np.percentile(motion_values, 25)),
+                    'q3_motion': float(np.percentile(motion_values, 75)),
+                })
+            
+            # SECOND PASS: Full analysis with same-image statistics available
+            for i, bbox in enumerate(bboxes):
+                if not isinstance(bbox, tuple) or len(bbox) != 4:
+                    continue
+                pill_metrics = pill_analyzer.analyze_pill(image, bbox, i, bboxes, bbox_stats)
                 pill_metrics_list.append(pill_metrics)
         
         result = {
@@ -874,14 +1451,20 @@ def classify_image(result: Dict, thresholds: CalibrationThresholds) -> Dict:
     bright_pill_count = 0
     dim_pill_count = 0
     motion_blur_pill_count = 0
+    on_side_count = 0
     
     for pm in pill_metrics_list:
         pill_issues = []
         
-        # Stacking detection
-        if pm['overlap_ratio'] > thresholds.pill_overlap_threshold:
+        # Stacking detection - use the computed boolean flag
+        if pm.get('is_stacking', False):
             pill_issues.append("stacking")
             stacking_count += 1
+        
+        # Pill placed on side (edge-on instead of flat)
+        if pm.get('is_on_side', False):
+            pill_issues.append("pill_on_side")
+            on_side_count += 1
         
         # Abnormal aspect ratio (might indicate partial pill or stacking)
         if (pm['aspect_ratio'] < 1/thresholds.pill_aspect_ratio_threshold or 
@@ -892,22 +1475,39 @@ def classify_image(result: Dict, thresholds: CalibrationThresholds) -> Dict:
         if pm['area_deviation'] > thresholds.pill_area_deviation_threshold:
             pill_issues.append("size_anomaly")
         
-        # Pill blur
-        if pm['laplacian_variance'] < thresholds.pill_blur_threshold:
+        # Pill blur - HYBRID: same-image outlier OR global threshold
+        # This catches pills that are blurry compared to siblings (localized issue)
+        # OR pills in images where everything is somewhat blurry but this one is worst
+        is_blurry = pm.get('is_blur_outlier', False)
+        if not is_blurry and pm['laplacian_variance'] < thresholds.pill_blur_threshold:
+            is_blurry = True
+        if is_blurry:
             pill_issues.append("pill_blur")
             blurry_pill_count += 1
         
-        # Pill brightness
-        if pm['mean_brightness'] > thresholds.pill_brightness_high:
+        # Pill brightness - HYBRID: same-image outlier OR global threshold
+        # Catches localized lighting issues where one pill is different from siblings
+        is_bright_issue = pm.get('is_brightness_outlier', False)
+        brightness_type = pm.get('brightness_outlier_type', '')
+        
+        if is_bright_issue and brightness_type == 'overexposed':
+            pill_issues.append("pill_overexposed_vs_siblings")
+            bright_pill_count += 1
+        elif pm['mean_brightness'] > thresholds.pill_brightness_high:
             pill_issues.append("pill_overexposed")
             bright_pill_count += 1
         
-        if pm['mean_brightness'] < thresholds.pill_brightness_low:
+        if is_bright_issue and brightness_type == 'underexposed':
+            pill_issues.append("pill_underexposed_vs_siblings")
+            dim_pill_count += 1
+        elif pm['mean_brightness'] < thresholds.pill_brightness_low:
             pill_issues.append("pill_underexposed")
             dim_pill_count += 1
         
-        # Motion blur on pill
-        if pm['motion_blur_score'] > thresholds.motion_blur_threshold:
+        # Motion blur on pill (pill was settling/moving when captured)
+        # HYBRID: same-image outlier detection OR absolute detection
+        has_motion = pm.get('has_motion_blur', False) or pm.get('is_motion_outlier', False)
+        if has_motion:
             pill_issues.append("pill_motion_blur")
             motion_blur_pill_count += 1
         
@@ -919,6 +1519,9 @@ def classify_image(result: Dict, thresholds: CalibrationThresholds) -> Dict:
     # Aggregate pill-level issues
     if stacking_count > 0:
         pill_level_issues.append(f"stacking_detected_{stacking_count}_pills")
+    
+    if on_side_count > 0:
+        pill_level_issues.append(f"pills_on_side_{on_side_count}")
     
     if blurry_pill_count > 0:
         pill_level_issues.append(f"blurry_pills_{blurry_pill_count}")
