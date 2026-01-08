@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Pill stacking detection v2.
-Detects when a pill is stacked on another by analyzing the segmented shape.
+Pill stacking detection v3.
 
-Key insight: When stacked, the bottom pill's contour is:
-- Irregular (not a clean ellipse)
-- Partially occluded (missing part of its shape)
-- Has poor ellipse fit quality
+Key insight: When YOLO detects both stacked pills:
+- Top pill bbox = contains normal single pill
+- Bottom pill bbox = contains PART of top pill + visible part of bottom pill
 
-Detection methods:
-1. Ellipse fit quality - how well does contour match fitted ellipse
-2. Contour solidity - ratio of contour area to convex hull area
-3. Multiple contours - if bbox contains multiple separate pill regions
+So if we segment a bbox and find it contains portions of 2 pills 
+(2 separate bright regions), that indicates stacking.
+
+Also: Top pill may cast a SHADOW on the bottom pill, creating a darker
+region/edge that's unusual.
 """
 
 import cv2
 import numpy as np
 import pickle
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 
 def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
@@ -39,175 +38,226 @@ def load_bboxes(bbox_path: str) -> List[Tuple[int, int, int, int]]:
     return bboxes
 
 
-def segment_all_contours(crop_bgr: np.ndarray, min_area: int = 100) -> List[np.ndarray]:
+def count_pill_regions(crop_bgr: np.ndarray, min_region_ratio: float = 0.15) -> Dict:
     """
-    Segment ALL contours in a crop (not just the center one).
-    Returns list of contours.
+    Count how many separate pill-like regions are in the crop.
+    
+    If there are 2+ regions, it suggests the bbox contains parts of 
+    multiple pills (stacking scenario).
+    
+    Args:
+        crop_bgr: Cropped image
+        min_region_ratio: Minimum size of region relative to largest (0-1)
+    
+    Returns:
+        Dict with num_regions, region_areas, etc.
     """
     if crop_bgr.shape[0] < 10 or crop_bgr.shape[1] < 10:
-        return []
+        return {'num_regions': 0, 'regions': []}
     
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     
-    # Otsu threshold
+    # Threshold
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # Clean up
+    # Morphological operations to separate touching regions slightly
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
     
-    # Find all contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh)
     
-    # Filter by minimum area
-    valid_contours = [c for c in contours if cv2.contourArea(c) > min_area]
+    # Filter regions (skip background label 0)
+    regions = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > 50:  # Minimum pixel area
+            regions.append({
+                'label': i,
+                'area': area,
+                'centroid': centroids[i],
+                'bbox': (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                        stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
+            })
     
-    return valid_contours
+    if not regions:
+        return {'num_regions': 0, 'regions': []}
+    
+    # Sort by area
+    regions.sort(key=lambda r: r['area'], reverse=True)
+    
+    # Count significant regions (at least min_region_ratio of the largest)
+    largest_area = regions[0]['area']
+    significant_regions = [r for r in regions if r['area'] >= largest_area * min_region_ratio]
+    
+    return {
+        'num_regions': len(significant_regions),
+        'regions': significant_regions,
+        'all_regions': regions
+    }
 
 
-def compute_ellipse_fit_quality(contour: np.ndarray) -> float:
+def detect_shadow_edge(crop_bgr: np.ndarray) -> Dict:
     """
-    Compute how well a contour fits an ellipse.
+    Detect if there's a shadow edge inside the pill region.
     
-    Returns value 0-1:
-    - 1.0 = perfect ellipse
-    - <0.8 = irregular shape (possible occlusion)
+    When pill A is on top of pill B, pill A casts a shadow creating
+    a dark edge/line across pill B's surface.
+    
+    Returns:
+        Dict with has_shadow_edge, shadow_strength
     """
-    if len(contour) < 5:
-        return 0.0
+    if crop_bgr.shape[0] < 15 or crop_bgr.shape[1] < 15:
+        return {'has_shadow_edge': False, 'shadow_strength': 0}
     
-    # Fit ellipse
-    ellipse = cv2.fitEllipse(contour)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     
-    # Create ellipse mask
-    h = int(ellipse[0][1] + ellipse[1][1]) + 10
-    w = int(ellipse[0][0] + ellipse[1][0]) + 10
-    h = max(h, contour[:, :, 1].max() + 10)
-    w = max(w, contour[:, :, 0].max() + 10)
+    # Get pill mask
+    _, pill_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    ellipse_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(ellipse_mask, ellipse, 255, -1)
+    # Look for dark lines/edges within the pill region
+    # Use Canny edge detection
+    edges = cv2.Canny(gray, 50, 150)
     
-    # Create contour mask
-    contour_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+    # Only consider edges inside the pill
+    edges_in_pill = cv2.bitwise_and(edges, pill_mask)
     
-    # Compute overlap
-    intersection = np.sum((ellipse_mask > 0) & (contour_mask > 0))
-    union = np.sum((ellipse_mask > 0) | (contour_mask > 0))
+    # For shadow detection: look for horizontal/vertical dark gradients
+    # Shadow creates a distinct brightness change
     
-    if union == 0:
-        return 0.0
+    # Compute gradient
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     
-    return intersection / union
+    # Strong gradient inside pill = potential shadow edge
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+    grad_in_pill = grad_mag * (pill_mask > 0)
+    
+    # Compute ratio of high-gradient pixels inside pill
+    pill_pixels = np.sum(pill_mask > 0)
+    if pill_pixels == 0:
+        return {'has_shadow_edge': False, 'shadow_strength': 0}
+    
+    high_grad_pixels = np.sum(grad_in_pill > np.percentile(grad_in_pill[pill_mask > 0], 90))
+    grad_ratio = high_grad_pixels / pill_pixels
+    
+    # Also check for internal edges
+    internal_edge_ratio = np.sum(edges_in_pill > 0) / pill_pixels
+    
+    # Shadow indicator: significant internal gradient/edges
+    shadow_strength = (grad_ratio + internal_edge_ratio) / 2
+    has_shadow = shadow_strength > 0.05  # Threshold
+    
+    return {
+        'has_shadow_edge': has_shadow,
+        'shadow_strength': shadow_strength,
+        'internal_edge_ratio': internal_edge_ratio,
+        'grad_ratio': grad_ratio
+    }
 
 
-def compute_solidity(contour: np.ndarray) -> float:
+def detect_brightness_discontinuity(crop_bgr: np.ndarray) -> Dict:
     """
-    Compute solidity = contour_area / convex_hull_area.
+    Detect if the pill has a brightness discontinuity.
     
-    Low solidity = irregular/concave shape (possible occlusion)
-    Normal pill should have high solidity (~0.95+)
+    When stacked, the visible portion of bottom pill may have different
+    lighting than the top pill portion that intrudes into the bbox.
+    
+    Returns:
+        Dict with has_discontinuity, brightness_variance
     """
-    area = cv2.contourArea(contour)
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
+    if crop_bgr.shape[0] < 15 or crop_bgr.shape[1] < 15:
+        return {'has_discontinuity': False, 'brightness_std': 0}
     
-    if hull_area == 0:
-        return 0.0
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     
-    return area / hull_area
+    # Get pill mask
+    _, pill_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Get brightness values inside pill
+    pill_brightness = gray[pill_mask > 0]
+    
+    if len(pill_brightness) < 10:
+        return {'has_discontinuity': False, 'brightness_std': 0}
+    
+    # Compute statistics
+    mean_b = np.mean(pill_brightness)
+    std_b = np.std(pill_brightness)
+    
+    # High std relative to mean = discontinuity
+    cv = std_b / mean_b if mean_b > 0 else 0  # Coefficient of variation
+    
+    # Also check for bimodal distribution (two brightness peaks)
+    hist, _ = np.histogram(pill_brightness, bins=20)
+    
+    # Find peaks in histogram
+    peaks = []
+    for i in range(1, len(hist) - 1):
+        if hist[i] > hist[i-1] and hist[i] > hist[i+1] and hist[i] > len(pill_brightness) * 0.05:
+            peaks.append(i)
+    
+    has_discontinuity = cv > 0.15 or len(peaks) >= 2
+    
+    return {
+        'has_discontinuity': has_discontinuity,
+        'brightness_std': std_b,
+        'brightness_cv': cv,
+        'num_brightness_peaks': len(peaks)
+    }
 
 
-def compute_circularity(contour: np.ndarray) -> float:
+def is_stacking(crop_bgr: np.ndarray) -> Dict:
     """
-    Compute circularity = 4π * area / perimeter²
+    Determine if a pill bbox shows signs of stacking.
     
-    1.0 = perfect circle
-    Lower values = irregular shape
-    """
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    
-    if perimeter == 0:
-        return 0.0
-    
-    return 4 * np.pi * area / (perimeter ** 2)
-
-
-def analyze_pill_for_stacking(crop_bgr: np.ndarray) -> Dict:
-    """
-    Analyze a single pill crop for signs of stacking.
-    
-    Returns dict with:
-    - is_stacking: bool - whether stacking is detected
-    - num_contours: int - number of pill-like regions found
-    - ellipse_fit: float - how well main contour fits ellipse (0-1)
-    - solidity: float - contour area / convex hull area (0-1)
-    - circularity: float - shape circularity (0-1)
+    Returns:
+        Dict with is_stacking, reason, and detailed metrics
     """
     result = {
         'is_stacking': False,
-        'num_contours': 0,
-        'ellipse_fit': 1.0,
-        'solidity': 1.0,
-        'circularity': 1.0,
-        'reason': None
+        'reason': None,
+        'confidence': 0.0
     }
     
-    # Get all contours in the crop
-    contours = segment_all_contours(crop_bgr)
-    result['num_contours'] = len(contours)
+    # Method 1: Multiple regions
+    regions = count_pill_regions(crop_bgr)
+    result['num_regions'] = regions['num_regions']
     
-    if len(contours) == 0:
-        return result
-    
-    # Method 1: Multiple large contours = likely stacking
-    # If we see 2+ distinct pill-shaped regions, pills are stacked
-    crop_area = crop_bgr.shape[0] * crop_bgr.shape[1]
-    large_contours = [c for c in contours if cv2.contourArea(c) > crop_area * 0.1]
-    
-    if len(large_contours) >= 2:
+    if regions['num_regions'] >= 2:
         result['is_stacking'] = True
-        result['reason'] = f'multiple_contours({len(large_contours)})'
+        result['reason'] = f"multiple_regions({regions['num_regions']})"
+        result['confidence'] = 0.9
         return result
     
-    # Method 2: Analyze the main (largest) contour
-    main_contour = max(contours, key=cv2.contourArea)
+    # Method 2: Shadow edge detection
+    shadow = detect_shadow_edge(crop_bgr)
+    result['shadow_strength'] = shadow['shadow_strength']
     
-    if len(main_contour) >= 5:
-        # Ellipse fit quality
-        ellipse_fit = compute_ellipse_fit_quality(main_contour)
-        result['ellipse_fit'] = ellipse_fit
-        
-        # Solidity
-        solidity = compute_solidity(main_contour)
-        result['solidity'] = solidity
-        
-        # Circularity
-        circularity = compute_circularity(main_contour)
-        result['circularity'] = circularity
-        
-        # Stacking indicators:
-        # - Poor ellipse fit (contour doesn't match ellipse shape)
-        # - Low solidity (concave/irregular shape from occlusion)
-        
-        if ellipse_fit < 0.75:
-            result['is_stacking'] = True
-            result['reason'] = f'poor_ellipse_fit({ellipse_fit:.2f})'
-        elif solidity < 0.85:
-            result['is_stacking'] = True
-            result['reason'] = f'low_solidity({solidity:.2f})'
+    if shadow['has_shadow_edge'] and shadow['shadow_strength'] > 0.08:
+        result['is_stacking'] = True
+        result['reason'] = f"shadow_edge({shadow['shadow_strength']:.2f})"
+        result['confidence'] = 0.7
+        return result
+    
+    # Method 3: Brightness discontinuity
+    brightness = detect_brightness_discontinuity(crop_bgr)
+    result['brightness_cv'] = brightness['brightness_cv']
+    result['num_brightness_peaks'] = brightness['num_brightness_peaks']
+    
+    if brightness['has_discontinuity'] and brightness['num_brightness_peaks'] >= 2:
+        result['is_stacking'] = True
+        result['reason'] = f"brightness_discontinuity(peaks={brightness['num_brightness_peaks']})"
+        result['confidence'] = 0.6
+        return result
     
     return result
 
 
 def analyze_image(image_path: str, bbox_path: str) -> Dict:
-    """Analyze all pills in an image for stacking."""
+    """Analyze all pills for stacking."""
     image = cv2.imread(image_path)
     if image is None:
-        raise ValueError(f"Could not load image: {image_path}")
+        raise ValueError(f"Could not load: {image_path}")
     
     img_h, img_w = image.shape[:2]
     bboxes = load_bboxes(bbox_path)
@@ -224,8 +274,7 @@ def analyze_image(image_path: str, bbox_path: str) -> Dict:
             continue
         
         crop = image[y:y+h, x:x+w]
-        
-        analysis = analyze_pill_for_stacking(crop)
+        analysis = is_stacking(crop)
         analysis['bbox_id'] = i
         analysis['bbox'] = (x, y, w, h)
         
@@ -241,11 +290,8 @@ def analyze_image(image_path: str, bbox_path: str) -> Dict:
     }
 
 
-def visualize_stacking(image_path: str, bbox_path: str, output_path: str):
-    """
-    Visualize stacking detection.
-    Green = normal, Red = stacking detected
-    """
+def visualize(image_path: str, bbox_path: str, output_path: str):
+    """Visualize stacking detection."""
     image = cv2.imread(image_path)
     result = analyze_image(image_path, bbox_path)
     
@@ -255,67 +301,35 @@ def visualize_stacking(image_path: str, bbox_path: str, output_path: str):
         if pill['is_stacking']:
             color = (0, 0, 255)  # Red
             thickness = 3
-            # Show reason
-            label = pill['reason'][:15] if pill['reason'] else 'stack'
-            cv2.putText(image, label, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
         else:
             color = (0, 255, 0)  # Green
             thickness = 1
         
         cv2.rectangle(image, (x, y), (x+w, y+h), color, thickness)
     
-    # Legend
-    cv2.rectangle(image, (10, 10), (200, 50), (255, 255, 255), -1)
-    cv2.putText(image, "Green=OK, Red=Stacking", (15, 35), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    
     cv2.imwrite(output_path, image)
     print(f"Saved: {output_path}")
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
 if __name__ == '__main__':
     import argparse
     
-    parser = argparse.ArgumentParser(description="Pill stacking detection v2")
-    parser.add_argument('--image', '-i', required=True, help='Image path')
-    parser.add_argument('--bboxes', '-b', required=True, help='Bbox pickle file')
-    parser.add_argument('--output', '-o', default='./stacking_v2_result.jpg')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image', '-i', required=True)
+    parser.add_argument('--bboxes', '-b', required=True)
+    parser.add_argument('--output', '-o', default='./stacking_v3_result.jpg')
     
     args = parser.parse_args()
     
-    # Analyze
     result = analyze_image(args.image, args.bboxes)
     
-    # Summary
-    print(f"\n{'='*50}")
-    print(f"STACKING DETECTION RESULTS")
-    print(f"{'='*50}")
-    print(f"Total pills: {result['total_pills']}")
+    print(f"\nTotal pills: {result['total_pills']}")
     print(f"Stacking detected: {result['stacking_count']}")
     
-    # Show stacking details
     stacked = [p for p in result['pills'] if p['is_stacking']]
     if stacked:
         print(f"\nStacked pills:")
         for p in stacked:
             print(f"  #{p['bbox_id']}: {p['reason']}")
-            print(f"    ellipse_fit={p['ellipse_fit']:.2f}, "
-                  f"solidity={p['solidity']:.2f}, "
-                  f"contours={p['num_contours']}")
     
-    # Show metrics distribution
-    pills = result['pills']
-    if pills:
-        fits = [p['ellipse_fit'] for p in pills]
-        sols = [p['solidity'] for p in pills]
-        
-        print(f"\nMetrics distribution:")
-        print(f"  Ellipse fit: min={min(fits):.2f}, max={max(fits):.2f}, median={np.median(fits):.2f}")
-        print(f"  Solidity: min={min(sols):.2f}, max={max(sols):.2f}, median={np.median(sols):.2f}")
-    
-    # Visualize
-    visualize_stacking(args.image, args.bboxes, args.output)
+    visualize(args.image, args.bboxes, args.output)
