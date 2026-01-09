@@ -1105,10 +1105,16 @@ def train_epoch(
     
     model.train()
     
-    loss_meter = AverageMeter()
+    # Loss meters
+    total_loss_meter = AverageMeter()
+    script_loss_meter = AverageMeter()
+    anomaly_loss_meter = AverageMeter()
+    cls_loss_meter = AverageMeter()  # ResNet classification loss
+    
+    # Accuracy meters
     script_acc_meter = AverageMeter()
     anomaly_acc_meter = AverageMeter()
-    cls_acc_meter = AverageMeter()
+    cls_acc_meter = AverageMeter()  # Pill identification accuracy
     
     if ddp.is_main_process():
         pbar = tqdm(total=len(train_loader), desc=f'Epoch {epoch}', dynamic_ncols=True)
@@ -1156,27 +1162,47 @@ def train_epoch(
             is_correct, pill_correct, labels, pill_mask
         )
         
-        loss_meter.update(loss_dict['total'], B)
+        # Update loss meters
+        total_loss_meter.update(loss_dict['total'], B)
+        script_loss_meter.update(loss_dict['script'], B)
+        anomaly_loss_meter.update(loss_dict['anomaly'], B)
+        cls_loss_meter.update(loss_dict['cls'], B)
+        
+        # Update accuracy meters
         script_acc_meter.update(metrics['script_acc'], B)
         anomaly_acc_meter.update(metrics['anomaly_acc'], B)
         cls_acc_meter.update(metrics['cls_acc'], B)
         
         if ddp.is_main_process():
             pbar.set_postfix({
-                'loss': f'{loss_meter.avg:.4f}',
-                'script': f'{script_acc_meter.avg:.4f}',
-                'anom': f'{anomaly_acc_meter.avg:.4f}',
-                'cls': f'{cls_acc_meter.avg:.4f}'
+                'loss': f'{total_loss_meter.avg:.4f}',
+                'script_loss': f'{script_loss_meter.avg:.4f}',
+                'resnet_loss': f'{cls_loss_meter.avg:.4f}',
+                'script_acc': f'{script_acc_meter.avg:.4f}',
+                'pill_acc': f'{cls_acc_meter.avg:.4f}'
             })
             pbar.update(1)
+            
+            # Log every N steps
+            if (step + 1) % config.log_every_n_steps == 0:
+                logger.info(
+                    f"Epoch {epoch} Step {step+1}/{len(train_loader)} | "
+                    f"Loss: {total_loss_meter.avg:.4f} | "
+                    f"Script Loss: {script_loss_meter.avg:.4f} | "
+                    f"ResNet Loss: {cls_loss_meter.avg:.4f} | "
+                    f"Script Acc: {script_acc_meter.avg:.4f} | "
+                    f"Pill Acc: {cls_acc_meter.avg:.4f}"
+                )
     
     if ddp.is_main_process():
         pbar.close()
     
-    # Sync metrics
+    # Sync metrics across GPUs
     if ddp.is_distributed:
         metrics_tensor = torch.tensor([
-            loss_meter.sum, loss_meter.count,
+            total_loss_meter.sum, total_loss_meter.count,
+            script_loss_meter.sum, script_loss_meter.count,
+            cls_loss_meter.sum, cls_loss_meter.count,
             script_acc_meter.sum, script_acc_meter.count,
             cls_acc_meter.sum, cls_acc_meter.count
         ], device=ddp.device, dtype=torch.float64)
@@ -1184,15 +1210,19 @@ def train_epoch(
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
         
         return {
-            'loss': metrics_tensor[0].item() / max(metrics_tensor[1].item(), 1),
-            'script_acc': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
-            'cls_acc': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1)
+            'total_loss': metrics_tensor[0].item() / max(metrics_tensor[1].item(), 1),
+            'script_loss': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
+            'resnet_loss': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1),
+            'script_acc': metrics_tensor[6].item() / max(metrics_tensor[7].item(), 1),
+            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1)
         }
     
     return {
-        'loss': loss_meter.avg,
+        'total_loss': total_loss_meter.avg,
+        'script_loss': script_loss_meter.avg,
+        'resnet_loss': cls_loss_meter.avg,
         'script_acc': script_acc_meter.avg,
-        'cls_acc': cls_acc_meter.avg
+        'pill_acc': cls_acc_meter.avg
     }
 
 
@@ -1202,12 +1232,18 @@ def validate(
     val_loader: DataLoader,
     config: TrainingConfig,
     ddp: DDPManager,
-    epoch: int
+    epoch: int,
+    logger: logging.Logger
 ) -> Dict[str, float]:
     
     model.eval()
     
-    loss_meter = AverageMeter()
+    # Loss meters
+    total_loss_meter = AverageMeter()
+    script_loss_meter = AverageMeter()
+    cls_loss_meter = AverageMeter()
+    
+    # Accuracy meters
     script_acc_meter = AverageMeter()
     anomaly_acc_meter = AverageMeter()
     cls_acc_meter = AverageMeter()
@@ -1232,7 +1268,7 @@ def validate(
                 images, rx_ndcs, rx_counts, pill_mask, rx_mask
             )
             
-            loss, _ = compute_losses(
+            loss, loss_dict = compute_losses(
                 script_logit, pill_anomaly, pill_logits,
                 is_correct, pill_correct, labels, pill_mask,
                 config
@@ -1243,16 +1279,20 @@ def validate(
             is_correct, pill_correct, labels, pill_mask
         )
         
-        loss_meter.update(loss.item(), B)
+        # Update meters
+        total_loss_meter.update(loss_dict['total'], B)
+        script_loss_meter.update(loss_dict['script'], B)
+        cls_loss_meter.update(loss_dict['cls'], B)
+        
         script_acc_meter.update(metrics['script_acc'], B)
         anomaly_acc_meter.update(metrics['anomaly_acc'], B)
         cls_acc_meter.update(metrics['cls_acc'], B)
         
         if ddp.is_main_process():
             pbar.set_postfix({
-                'loss': f'{loss_meter.avg:.4f}',
-                'script': f'{script_acc_meter.avg:.4f}',
-                'cls': f'{cls_acc_meter.avg:.4f}'
+                'loss': f'{total_loss_meter.avg:.4f}',
+                'script_acc': f'{script_acc_meter.avg:.4f}',
+                'pill_acc': f'{cls_acc_meter.avg:.4f}'
             })
             pbar.update(1)
     
@@ -1262,7 +1302,9 @@ def validate(
     # Sync
     if ddp.is_distributed:
         metrics_tensor = torch.tensor([
-            loss_meter.sum, loss_meter.count,
+            total_loss_meter.sum, total_loss_meter.count,
+            script_loss_meter.sum, script_loss_meter.count,
+            cls_loss_meter.sum, cls_loss_meter.count,
             script_acc_meter.sum, script_acc_meter.count,
             cls_acc_meter.sum, cls_acc_meter.count
         ], device=ddp.device, dtype=torch.float64)
@@ -1270,15 +1312,19 @@ def validate(
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
         
         return {
-            'loss': metrics_tensor[0].item() / max(metrics_tensor[1].item(), 1),
-            'script_acc': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
-            'cls_acc': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1)
+            'total_loss': metrics_tensor[0].item() / max(metrics_tensor[1].item(), 1),
+            'script_loss': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
+            'resnet_loss': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1),
+            'script_acc': metrics_tensor[6].item() / max(metrics_tensor[7].item(), 1),
+            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1)
         }
     
     return {
-        'loss': loss_meter.avg,
+        'total_loss': total_loss_meter.avg,
+        'script_loss': script_loss_meter.avg,
+        'resnet_loss': cls_loss_meter.avg,
         'script_acc': script_acc_meter.avg,
-        'cls_acc': cls_acc_meter.avg
+        'pill_acc': cls_acc_meter.avg
     }
 
 
@@ -1526,19 +1572,25 @@ def main():
         )
         
         logger.info(
-            f"Train | Loss: {train_metrics['loss']:.4f} | "
-            f"Script: {train_metrics['script_acc']:.4f} | "
-            f"Cls: {train_metrics['cls_acc']:.4f}"
+            f"Train | "
+            f"Total Loss: {train_metrics['total_loss']:.4f} | "
+            f"Script Loss: {train_metrics['script_loss']:.4f} | "
+            f"ResNet Loss: {train_metrics['resnet_loss']:.4f} | "
+            f"Script Acc: {train_metrics['script_acc']:.4f} | "
+            f"Pill Acc: {train_metrics['pill_acc']:.4f}"
         )
         
         # Validate
         if (epoch + 1) % config.validate_every_n_epochs == 0:
-            val_metrics = validate(model, val_loader, config, ddp, epoch)
+            val_metrics = validate(model, val_loader, config, ddp, epoch, logger)
             
             logger.info(
-                f"Val   | Loss: {val_metrics['loss']:.4f} | "
-                f"Script: {val_metrics['script_acc']:.4f} | "
-                f"Cls: {val_metrics['cls_acc']:.4f}"
+                f"Val   | "
+                f"Total Loss: {val_metrics['total_loss']:.4f} | "
+                f"Script Loss: {val_metrics['script_loss']:.4f} | "
+                f"ResNet Loss: {val_metrics['resnet_loss']:.4f} | "
+                f"Script Acc: {val_metrics['script_acc']:.4f} | "
+                f"Pill Acc: {val_metrics['pill_acc']:.4f}"
             )
             
             is_best = val_metrics['script_acc'] > best_script_acc
