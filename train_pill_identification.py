@@ -283,7 +283,7 @@ class DatasetIndexer:
     Directory structure: {split}/{ndc}/{ndc}_{prescription_id}_{patch_no}.jpg
     """
     
-    FILENAME_PATTERN = re.compile(r'^(.+)_(.+)_(\d+)\.jpg$', re.IGNORECASE)
+    FILENAME_PATTERN = re.compile(r'^(.+)_(.+)_patch_(\d+)\.jpg$', re.IGNORECASE)
     
     @classmethod
     def build_index(cls, data_dir: str, output_file: str, splits: List[str] = ['train', 'valid']) -> Dict[str, int]:
@@ -1625,6 +1625,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--error-rate', type=float, default=0.5, help='Synthetic error rate')
+    parser.add_argument('--min-pills', type=int, default=5, help='Minimum pills per prescription')
+    parser.add_argument('--max-pills', type=int, default=200, help='Maximum pills per prescription')
     
     # Resume
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
@@ -1693,6 +1695,46 @@ def main():
     
     config.num_classes = len(class_to_idx)
     logger.info(f"Found {config.num_classes} NDC classes")
+    
+    # Override min/max pills from command line
+    config.min_pills_per_prescription = args.min_pills
+    config.max_pills_per_prescription = args.max_pills
+    logger.info(f"Prescription filter: {config.min_pills_per_prescription}-{config.max_pills_per_prescription} pills")
+    
+    # Analyze data before creating datasets
+    if ddp_manager.is_main_process():
+        train_prescriptions_raw = defaultdict(list)
+        for item in data_by_split.get('train', []):
+            train_prescriptions_raw[item['prescription_id']].append(item)
+        
+        if len(train_prescriptions_raw) == 0:
+            raise ValueError(
+                "No training data found in index file!\n"
+                "Check that your index file contains 'train' split data.\n"
+                f"Run: python diagnose_dataset.py --data-dir {config.data_dir}"
+            )
+        
+        pill_counts = [len(pills) for pills in train_prescriptions_raw.values()]
+        logger.info(f"Raw train prescriptions: {len(train_prescriptions_raw)}")
+        logger.info(f"Pills per prescription: min={min(pill_counts)}, max={max(pill_counts)}, mean={sum(pill_counts)/len(pill_counts):.1f}")
+        
+        # Count how many will pass filter
+        filtered_count = sum(1 for pills in train_prescriptions_raw.values() 
+                           if config.min_pills_per_prescription <= len(pills) <= config.max_pills_per_prescription)
+        logger.info(f"Prescriptions passing filter ({config.min_pills_per_prescription}-{config.max_pills_per_prescription} pills): {filtered_count}")
+        
+        if filtered_count == 0:
+            raise ValueError(
+                f"All prescriptions filtered out!\n"
+                f"Your prescriptions have {min(pill_counts)}-{max(pill_counts)} pills,\n"
+                f"but filter requires {config.min_pills_per_prescription}-{config.max_pills_per_prescription} pills.\n"
+                f"\nSolution: Adjust --min-pills and --max-pills arguments.\n"
+                f"Suggested: --min-pills {min(pill_counts)} --max-pills {max(pill_counts)}\n"
+                f"\nOr run: python diagnose_dataset.py --data-dir {config.data_dir}"
+            )
+    
+    # Sync before creating datasets
+    ddp_manager.barrier()
     
     # Create datasets
     train_dataset = PrescriptionDataset(
