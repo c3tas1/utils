@@ -1,246 +1,215 @@
 #!/bin/bash
 # =============================================================================
-# Launch script for Prescription-Aware Pill Verification Training
-# Optimized for DGX A100 (8x A100 40GB)
+# End-to-End Pill Verification Training on DGX A100
+# Trains BOTH the ResNet backbone AND the verifier
 # =============================================================================
 
 set -e
 
 # Configuration
-export DATA_DIR="${DATA_DIR:-/path/to/your/data}"
-export OUTPUT_DIR="${OUTPUT_DIR:-./output}"
-export RESNET_CHECKPOINT="${RESNET_CHECKPOINT:-}"  # Optional pretrained checkpoint
+DATA_DIR="${DATA_DIR:-/path/to/data}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 
-# Training hyperparameters
-export EPOCHS="${EPOCHS:-100}"
-export BATCH_SIZE="${BATCH_SIZE:-4}"  # Per GPU
-export LR="${LR:-1e-4}"
-export ERROR_RATE="${ERROR_RATE:-0.5}"
-export NUM_WORKERS="${NUM_WORKERS:-8}"
-export SEED="${SEED:-42}"
+# Training settings
+EPOCHS="${EPOCHS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-2}"           # Per GPU (small because training backbone)
+ACCUMULATION="${ACCUMULATION:-4}"        # Gradient accumulation steps
+# Effective batch = 2 * 4 * 8 GPUs = 64
 
-# DDP settings
-export MASTER_ADDR="${MASTER_ADDR:-localhost}"
-export MASTER_PORT="${MASTER_PORT:-29500}"
-export WORLD_SIZE="${WORLD_SIZE:-8}"
+# Learning rates (differential)
+BACKBONE_LR="${BACKBONE_LR:-1e-5}"       # Lower for pretrained backbone
+CLASSIFIER_LR="${CLASSIFIER_LR:-1e-4}"   # Medium for classifier
+VERIFIER_LR="${VERIFIER_LR:-1e-4}"       # Higher for new layers
 
-# NCCL optimizations for A100 with NVLink/NVSwitch
+# Model
+BACKBONE="${BACKBONE:-resnet34}"         # resnet34 or resnet50
+
+# Data
+MIN_PILLS="${MIN_PILLS:-5}"
+MAX_PILLS="${MAX_PILLS:-200}"
+ERROR_RATE="${ERROR_RATE:-0.5}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+
+# DDP
+WORLD_SIZE="${WORLD_SIZE:-8}"
+MASTER_ADDR="${MASTER_ADDR:-localhost}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
+# Seed
+SEED="${SEED:-42}"
+
+# Logging
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_DIR="${OUTPUT_DIR}/logs"
+LOG_FILE="${LOG_DIR}/launch_${TIMESTAMP}.log"
+
+# NCCL optimizations for A100
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=0
 export NCCL_P2P_DISABLE=0
 export NCCL_ASYNC_ERROR_HANDLING=1
 
-# For better performance on DGX A100
-export NCCL_ALGO=Ring
-export NCCL_PROTO=Simple
-
-# CUDA settings
+# CUDA
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# PyTorch settings
-export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # =============================================================================
-# Functions
-# =============================================================================
 
-print_header() {
-    echo "============================================================================="
-    echo "$1"
-    echo "============================================================================="
+log() {
+    echo "$@" | tee -a "$LOG_FILE"
+}
+
+setup_logging() {
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    log "End-to-End Training - $(date)"
+    log "Logging to: $LOG_FILE"
 }
 
 check_gpus() {
-    print_header "Checking GPU Configuration"
+    log ""
+    log "=== GPU Configuration ==="
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee -a "$LOG_FILE"
     
-    # Check NVIDIA driver
-    if ! command -v nvidia-smi &> /dev/null; then
-        echo "ERROR: nvidia-smi not found. Please install NVIDIA drivers."
-        exit 1
-    fi
-    
-    # Print GPU info
-    nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
-    echo ""
-    
-    # Check for A100
-    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-    if [[ "$GPU_NAME" == *"A100"* ]]; then
-        echo "✓ A100 GPU detected: $GPU_NAME"
-    else
-        echo "WARNING: Expected A100 GPU, found: $GPU_NAME"
-    fi
-    
-    # Count GPUs
     GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    echo "✓ Found $GPU_COUNT GPUs"
+    log "Found $GPU_COUNT GPUs"
     
     if [ "$GPU_COUNT" -lt "$WORLD_SIZE" ]; then
-        echo "WARNING: WORLD_SIZE=$WORLD_SIZE but only $GPU_COUNT GPUs available"
-        export WORLD_SIZE=$GPU_COUNT
+        log "WARNING: Reducing WORLD_SIZE from $WORLD_SIZE to $GPU_COUNT"
+        WORLD_SIZE=$GPU_COUNT
     fi
 }
 
 check_data() {
-    print_header "Checking Data Directory"
+    log ""
+    log "=== Data Check ==="
     
     if [ ! -d "$DATA_DIR" ]; then
-        echo "ERROR: Data directory not found: $DATA_DIR"
+        log "ERROR: Data directory not found: $DATA_DIR"
         exit 1
     fi
+    log "Data: $DATA_DIR"
     
-    echo "✓ Data directory: $DATA_DIR"
-    
-    # Check for train/valid subdirectories
-    if [ -d "$DATA_DIR/train" ]; then
-        TRAIN_NDCS=$(ls -d "$DATA_DIR/train"/*/ 2>/dev/null | wc -l)
-        echo "✓ Train directory found with $TRAIN_NDCS NDC subdirectories"
-    else
-        echo "ERROR: $DATA_DIR/train not found"
-        exit 1
-    fi
-    
-    if [ -d "$DATA_DIR/valid" ]; then
-        VALID_NDCS=$(ls -d "$DATA_DIR/valid"/*/ 2>/dev/null | wc -l)
-        echo "✓ Valid directory found with $VALID_NDCS NDC subdirectories"
-    else
-        echo "ERROR: $DATA_DIR/valid not found"
-        exit 1
-    fi
-    
-    # Check for index file
     INDEX_FILE="$DATA_DIR/dataset_index.csv"
-    if [ -f "$INDEX_FILE" ]; then
-        LINE_COUNT=$(wc -l < "$INDEX_FILE")
-        echo "✓ Index file found: $INDEX_FILE ($LINE_COUNT lines)"
+    if [ ! -f "$INDEX_FILE" ]; then
+        log "Building index..."
+        python train_e2e_a100.py --build-index --data-dir "$DATA_DIR" 2>&1 | tee -a "$LOG_FILE"
     else
-        echo "Index file not found. Will build index first..."
-        BUILD_INDEX=true
+        log "Index found: $(wc -l < "$INDEX_FILE") lines"
     fi
-}
-
-build_index() {
-    print_header "Building Dataset Index"
-    
-    python train_prescription_verifier.py \
-        --build-index \
-        --data-dir "$DATA_DIR"
-    
-    echo "✓ Index built successfully"
 }
 
 run_training() {
-    print_header "Starting Distributed Training"
+    log ""
+    log "=== Training Configuration ==="
+    log "Backbone: $BACKBONE"
+    log "Epochs: $EPOCHS"
+    log "Batch size: $BATCH_SIZE × $ACCUMULATION accum × $WORLD_SIZE GPUs = $((BATCH_SIZE * ACCUMULATION * WORLD_SIZE)) effective"
+    log "Learning rates: backbone=$BACKBONE_LR, classifier=$CLASSIFIER_LR, verifier=$VERIFIER_LR"
+    log "Pills per Rx: $MIN_PILLS - $MAX_PILLS"
+    log "Error rate: $ERROR_RATE"
+    log ""
     
-    echo "Configuration:"
-    echo "  Data directory: $DATA_DIR"
-    echo "  Output directory: $OUTPUT_DIR"
-    echo "  Epochs: $EPOCHS"
-    echo "  Batch size (per GPU): $BATCH_SIZE"
-    echo "  Learning rate: $LR"
-    echo "  Error rate: $ERROR_RATE"
-    echo "  World size: $WORLD_SIZE"
-    echo "  Master: $MASTER_ADDR:$MASTER_PORT"
-    echo ""
-    
-    # Create output directory
-    mkdir -p "$OUTPUT_DIR"
-    
-    # Build torchrun command
     CMD="torchrun \
         --nproc_per_node=$WORLD_SIZE \
         --master_addr=$MASTER_ADDR \
         --master_port=$MASTER_PORT \
-        train_prescription_verifier.py \
+        train_e2e_a100.py \
         --data-dir $DATA_DIR \
         --output-dir $OUTPUT_DIR \
+        --backbone $BACKBONE \
         --epochs $EPOCHS \
         --batch-size $BATCH_SIZE \
-        --lr $LR \
+        --accumulation-steps $ACCUMULATION \
+        --backbone-lr $BACKBONE_LR \
+        --classifier-lr $CLASSIFIER_LR \
+        --verifier-lr $VERIFIER_LR \
+        --min-pills $MIN_PILLS \
+        --max-pills $MAX_PILLS \
         --error-rate $ERROR_RATE \
         --workers $NUM_WORKERS \
         --seed $SEED"
     
-    # Add optional arguments
-    if [ -n "$RESNET_CHECKPOINT" ] && [ -f "$RESNET_CHECKPOINT" ]; then
-        CMD="$CMD --resnet-checkpoint $RESNET_CHECKPOINT"
-        echo "Using pretrained ResNet: $RESNET_CHECKPOINT"
-    fi
-    
     if [ -n "$RESUME_FROM" ] && [ -f "$RESUME_FROM" ]; then
         CMD="$CMD --resume $RESUME_FROM"
-        echo "Resuming from: $RESUME_FROM"
+        log "Resuming from: $RESUME_FROM"
     fi
     
-    echo ""
-    echo "Running command:"
-    echo "$CMD"
-    echo ""
+    log "Command: $CMD"
+    log ""
     
-    # Run training with error handling
-    if ! eval "$CMD"; then
-        echo ""
-        echo "ERROR: Training failed!"
-        echo "Check the logs in $OUTPUT_DIR for details."
+    if ! eval "$CMD" 2>&1 | tee -a "$LOG_FILE"; then
+        log "ERROR: Training failed!"
         exit 1
     fi
     
+    log ""
+    log "Training complete!"
+}
+
+show_help() {
+    echo "End-to-End Pill Verification Training on DGX A100"
     echo ""
-    echo "✓ Training completed successfully!"
-    echo "Results saved to: $OUTPUT_DIR"
+    echo "Usage: bash launch_e2e_a100.sh [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --data-dir DIR          Data directory"
+    echo "  --output-dir DIR        Output directory"
+    echo "  --backbone MODEL        resnet34 or resnet50"
+    echo "  --resume CHECKPOINT     Resume from checkpoint"
+    echo "  --build-index-only      Build index and exit"
+    echo "  --help                  Show help"
+    echo ""
+    echo "Environment variables:"
+    echo "  EPOCHS, BATCH_SIZE, ACCUMULATION"
+    echo "  BACKBONE_LR, CLASSIFIER_LR, VERIFIER_LR"
+    echo "  MIN_PILLS, MAX_PILLS, ERROR_RATE"
+    echo "  WORLD_SIZE, NUM_WORKERS"
+    echo ""
+    echo "Example:"
+    echo "  DATA_DIR=/data/pills EPOCHS=50 bash launch_e2e_a100.sh"
 }
 
 # =============================================================================
 # Main
 # =============================================================================
 
-print_header "Prescription-Aware Pill Verification Training"
-echo "Starting at $(date)"
-echo ""
+BUILD_INDEX_ONLY=""
+RESUME_FROM=""
 
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --build-index-only)
-            BUILD_INDEX_ONLY=true
-            shift
-            ;;
-        --resume)
-            RESUME_FROM="$2"
-            shift 2
-            ;;
-        --data-dir)
-            DATA_DIR="$2"
-            shift 2
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        *)
-            echo "Unknown option: $1"
-            exit 1
-            ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --data-dir) DATA_DIR="$2"; shift 2 ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --backbone) BACKBONE="$2"; shift 2 ;;
+        --resume) RESUME_FROM="$2"; shift 2 ;;
+        --build-index-only) BUILD_INDEX_ONLY="true"; shift ;;
+        --help|-h) show_help; exit 0 ;;
+        *) echo "Unknown: $1"; show_help; exit 1 ;;
     esac
 done
 
-# Run checks
+# Update log path
+LOG_DIR="${OUTPUT_DIR}/logs"
+LOG_FILE="${LOG_DIR}/launch_${TIMESTAMP}.log"
+
+setup_logging
+
+log "=== End-to-End Pill Verification Training ==="
+log "Training BOTH ResNet backbone AND Verifier"
+
 check_gpus
 check_data
 
-# Build index if needed
-if [ "$BUILD_INDEX" = true ] || [ "$BUILD_INDEX_ONLY" = true ]; then
-    build_index
-    if [ "$BUILD_INDEX_ONLY" = true ]; then
-        echo "Index built. Exiting."
-        exit 0
-    fi
+if [ "$BUILD_INDEX_ONLY" = "true" ]; then
+    log "Index built. Exiting."
+    exit 0
 fi
 
-# Run training
 run_training
 
-print_header "Done"
-echo "Finished at $(date)"
+log ""
+log "=== Complete ==="
+log "Finished: $(date)"
+log "Log: $LOG_FILE"
