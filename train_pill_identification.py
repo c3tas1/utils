@@ -107,7 +107,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 4  # Effective batch = 2 * 4 * 8 GPUs = 64
     
     # Learning rates (differential)
-    backbone_lr: float = 1e-5      # Lower for pretrained backbone
+    backbone_lr: float = 1e-4      # Increased - was too low at 1e-5
     classifier_lr: float = 1e-4    # Medium for classifier head
     verifier_lr: float = 1e-4      # Higher for new verifier
     weight_decay: float = 0.01
@@ -1155,6 +1155,18 @@ def train_epoch(
         pill_correct = batch['pill_correct'].to(ddp.device, non_blocking=True)
         
         B = images.size(0)
+        
+        # Debug logging for first batch of first epoch
+        if epoch == 0 and step == 0 and ddp.is_main_process():
+            valid_labels = labels[labels != -100]
+            logger.info(f"DEBUG: images shape = {images.shape}")
+            logger.info(f"DEBUG: labels shape = {labels.shape}")
+            logger.info(f"DEBUG: valid labels count = {valid_labels.numel()}")
+            logger.info(f"DEBUG: labels min = {valid_labels.min().item()}, max = {valid_labels.max().item()}")
+            logger.info(f"DEBUG: unique labels in batch = {valid_labels.unique().numel()}")
+            logger.info(f"DEBUG: pill_mask sum (padding count) = {pill_mask.sum().item()}")
+            logger.info(f"DEBUG: is_correct = {is_correct.tolist()}")
+        
         sync = (step + 1) % config.gradient_accumulation_steps == 0
         
         with ddp_sync_context(model, sync=sync):
@@ -1163,11 +1175,29 @@ def train_epoch(
                     images, rx_ndcs, rx_counts, pill_mask, rx_mask
                 )
                 
+                # Debug: check pill_logits
+                if epoch == 0 and step == 0 and ddp.is_main_process():
+                    logger.info(f"DEBUG: pill_logits shape = {pill_logits.shape}")
+                    logger.info(f"DEBUG: pill_logits min = {pill_logits.min().item():.4f}, max = {pill_logits.max().item():.4f}")
+                    # Check predicted classes
+                    pred_classes = pill_logits.argmax(dim=-1)
+                    valid_preds = pred_classes[~pill_mask]
+                    logger.info(f"DEBUG: predicted classes unique = {valid_preds.unique().numel()}")
+                    logger.info(f"DEBUG: pred min = {valid_preds.min().item()}, max = {valid_preds.max().item()}")
+                
                 loss, loss_dict = compute_losses(
                     script_logit, pill_anomaly, pill_logits,
                     is_correct, pill_correct, labels, pill_mask,
                     config
                 )
+                
+                # Debug: check loss values
+                if epoch == 0 and step == 0 and ddp.is_main_process():
+                    logger.info(f"DEBUG: script_loss = {loss_dict['script']:.4f}")
+                    logger.info(f"DEBUG: anomaly_loss = {loss_dict['anomaly']:.4f}")
+                    logger.info(f"DEBUG: cls_loss = {loss_dict['cls']:.4f}")
+                    logger.info(f"DEBUG: total_loss = {loss_dict['total']:.4f}")
+                
                 loss = loss / config.gradient_accumulation_steps
             
             scaler.scale(loss).backward()

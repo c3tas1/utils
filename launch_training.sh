@@ -1,3 +1,6 @@
+00 · SH
+Copy
+
 #!/bin/bash
 # =============================================================================
 # End-to-End Pill Verification Training on DGX A100
