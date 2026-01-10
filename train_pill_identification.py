@@ -89,7 +89,7 @@ class TrainingConfig:
     index_file: str = "dataset_index.csv"
     
     # Model architecture
-    num_classes: int = 1000
+    num_classes: int = 1228  # Number of NDCs
     backbone: str = "resnet34"  # resnet34 or resnet50
     pill_embed_dim: int = 512   # 512 for resnet34, 2048 for resnet50
     verifier_hidden_dim: int = 256
@@ -119,7 +119,7 @@ class TrainingConfig:
     # Loss weights
     script_loss_weight: float = 1.0
     pill_anomaly_loss_weight: float = 0.5
-    pill_classification_loss_weight: float = 0.3  # Helps backbone learn
+    pill_classification_loss_weight: float = 1.0  # Increased - important for backbone learning
     
     # Synthetic error injection
     error_rate: float = 0.5
@@ -486,31 +486,32 @@ class PrescriptionDataset(Dataset):
             is_correct = True
         
         images = []
-        labels = []
+        actual_labels = []  # Labels for what's ACTUALLY in the image (after any swaps)
         
         for pill in pills:
             img = self._load_image(pill['relative_path'])
             if self.transform:
                 img = self.transform(img)
             images.append(img)
-            labels.append(self.class_to_idx[pill['ndc']])
+            # Use the NDC of what's actually in the image (may be swapped)
+            actual_labels.append(self.class_to_idx[pill['ndc']])
         
         images = torch.stack(images)
-        labels = torch.tensor(labels, dtype=torch.long)
+        actual_labels = torch.tensor(actual_labels, dtype=torch.long)
         
-        # Expected composition (original, not modified)
+        # Expected composition (original prescription, before any swaps)
         comp = self.get_prescription_composition(rx_id)
         expected_ndcs = [self.class_to_idx[n] for n in comp.keys()]
         expected_counts = list(comp.values())
         
-        # Per-pill correctness
+        # Per-pill correctness (is this pill what it should be?)
         pill_correct = torch.ones(len(pills), dtype=torch.float)
         for i in wrong_indices:
             pill_correct[i] = 0.0
         
         return {
             'images': images,
-            'labels': labels,
+            'labels': actual_labels,  # What's actually in image (for ResNet training)
             'num_pills': len(pills),
             'expected_ndcs': torch.tensor(expected_ndcs, dtype=torch.long),
             'expected_counts': torch.tensor(expected_counts, dtype=torch.float),
@@ -1006,33 +1007,54 @@ def compute_metrics(
     """Compute accuracy metrics."""
     
     with torch.no_grad():
-        # Script accuracy
+        # Script accuracy (prescription-level pass/fail)
         script_pred = (torch.sigmoid(script_logit.squeeze(-1)) > 0.5).float()
         script_acc = (script_pred == is_correct).float().mean().item()
         
-        # Pill anomaly accuracy
+        # Pill anomaly detection accuracy
         anomaly_pred = (torch.sigmoid(pill_anomaly) > 0.5).float()
-        anomaly_target = 1 - pill_correct
-        valid = ~pill_mask
+        anomaly_target = 1 - pill_correct  # 1 = anomaly, 0 = correct
+        valid = ~pill_mask  # True for real pills, False for padding
         if valid.any():
-            anomaly_acc = ((anomaly_pred == anomaly_target) & valid).float().sum() / valid.sum()
+            anomaly_acc = ((anomaly_pred == anomaly_target) & valid).float().sum() / valid.float().sum()
             anomaly_acc = anomaly_acc.item()
         else:
             anomaly_acc = 0.0
         
-        # Pill classification accuracy (top-1)
-        pill_pred = pill_logits.argmax(dim=-1)
-        correct_cls = (pill_pred == pill_labels) & valid
-        if valid.any():
-            cls_acc = correct_cls.float().sum() / valid.sum()
-            cls_acc = cls_acc.item()
+        # Pill classification accuracy (ResNet's ability to identify NDC)
+        # Valid pills: not padding (label != -100) AND not masked
+        valid_for_cls = (pill_labels != -100) & valid
+        
+        if valid_for_cls.any():
+            # Top-1 accuracy
+            pill_pred = pill_logits.argmax(dim=-1)  # (B, N)
+            correct_top1 = (pill_pred == pill_labels) & valid_for_cls
+            cls_acc_top1 = correct_top1.float().sum() / valid_for_cls.float().sum()
+            cls_acc_top1 = cls_acc_top1.item()
+            
+            # Top-5 accuracy (more meaningful for 1000+ classes)
+            B, N, C = pill_logits.shape
+            pill_logits_flat = pill_logits.view(-1, C)  # (B*N, C)
+            pill_labels_flat = pill_labels.view(-1)  # (B*N,)
+            valid_flat = valid_for_cls.view(-1)  # (B*N,)
+            
+            # Get top-5 predictions
+            _, top5_preds = pill_logits_flat.topk(min(5, C), dim=-1)  # (B*N, 5)
+            
+            # Check if true label is in top-5
+            correct_top5 = (top5_preds == pill_labels_flat.unsqueeze(-1)).any(dim=-1)
+            correct_top5 = correct_top5 & valid_flat
+            cls_acc_top5 = correct_top5.float().sum() / valid_flat.float().sum()
+            cls_acc_top5 = cls_acc_top5.item()
         else:
-            cls_acc = 0.0
+            cls_acc_top1 = 0.0
+            cls_acc_top5 = 0.0
     
     return {
         'script_acc': script_acc,
         'anomaly_acc': anomaly_acc,
-        'cls_acc': cls_acc
+        'cls_acc': cls_acc_top1,
+        'cls_acc_top5': cls_acc_top5
     }
 
 
@@ -1114,7 +1136,8 @@ def train_epoch(
     # Accuracy meters
     script_acc_meter = AverageMeter()
     anomaly_acc_meter = AverageMeter()
-    cls_acc_meter = AverageMeter()  # Pill identification accuracy
+    cls_acc_meter = AverageMeter()      # Top-1 pill accuracy
+    cls_acc_top5_meter = AverageMeter() # Top-5 pill accuracy
     
     if ddp.is_main_process():
         pbar = tqdm(total=len(train_loader), desc=f'Epoch {epoch}', dynamic_ncols=True)
@@ -1172,14 +1195,14 @@ def train_epoch(
         script_acc_meter.update(metrics['script_acc'], B)
         anomaly_acc_meter.update(metrics['anomaly_acc'], B)
         cls_acc_meter.update(metrics['cls_acc'], B)
+        cls_acc_top5_meter.update(metrics['cls_acc_top5'], B)
         
         if ddp.is_main_process():
             pbar.set_postfix({
                 'loss': f'{total_loss_meter.avg:.4f}',
-                'script_loss': f'{script_loss_meter.avg:.4f}',
-                'resnet_loss': f'{cls_loss_meter.avg:.4f}',
                 'script_acc': f'{script_acc_meter.avg:.4f}',
-                'pill_acc': f'{cls_acc_meter.avg:.4f}'
+                'pill_top1': f'{cls_acc_meter.avg:.4f}',
+                'pill_top5': f'{cls_acc_top5_meter.avg:.4f}'
             })
             pbar.update(1)
             
@@ -1191,7 +1214,8 @@ def train_epoch(
                     f"Script Loss: {script_loss_meter.avg:.4f} | "
                     f"ResNet Loss: {cls_loss_meter.avg:.4f} | "
                     f"Script Acc: {script_acc_meter.avg:.4f} | "
-                    f"Pill Acc: {cls_acc_meter.avg:.4f}"
+                    f"Pill Top1: {cls_acc_meter.avg:.4f} | "
+                    f"Pill Top5: {cls_acc_top5_meter.avg:.4f}"
                 )
     
     if ddp.is_main_process():
@@ -1204,7 +1228,8 @@ def train_epoch(
             script_loss_meter.sum, script_loss_meter.count,
             cls_loss_meter.sum, cls_loss_meter.count,
             script_acc_meter.sum, script_acc_meter.count,
-            cls_acc_meter.sum, cls_acc_meter.count
+            cls_acc_meter.sum, cls_acc_meter.count,
+            cls_acc_top5_meter.sum, cls_acc_top5_meter.count
         ], device=ddp.device, dtype=torch.float64)
         
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
@@ -1214,7 +1239,8 @@ def train_epoch(
             'script_loss': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
             'resnet_loss': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1),
             'script_acc': metrics_tensor[6].item() / max(metrics_tensor[7].item(), 1),
-            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1)
+            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1),
+            'pill_acc_top5': metrics_tensor[10].item() / max(metrics_tensor[11].item(), 1)
         }
     
     return {
@@ -1222,7 +1248,8 @@ def train_epoch(
         'script_loss': script_loss_meter.avg,
         'resnet_loss': cls_loss_meter.avg,
         'script_acc': script_acc_meter.avg,
-        'pill_acc': cls_acc_meter.avg
+        'pill_acc': cls_acc_meter.avg,
+        'pill_acc_top5': cls_acc_top5_meter.avg
     }
 
 
@@ -1247,6 +1274,7 @@ def validate(
     script_acc_meter = AverageMeter()
     anomaly_acc_meter = AverageMeter()
     cls_acc_meter = AverageMeter()
+    cls_acc_top5_meter = AverageMeter()
     
     if ddp.is_main_process():
         pbar = tqdm(total=len(val_loader), desc=f'Val {epoch}', dynamic_ncols=True)
@@ -1287,12 +1315,14 @@ def validate(
         script_acc_meter.update(metrics['script_acc'], B)
         anomaly_acc_meter.update(metrics['anomaly_acc'], B)
         cls_acc_meter.update(metrics['cls_acc'], B)
+        cls_acc_top5_meter.update(metrics['cls_acc_top5'], B)
         
         if ddp.is_main_process():
             pbar.set_postfix({
                 'loss': f'{total_loss_meter.avg:.4f}',
                 'script_acc': f'{script_acc_meter.avg:.4f}',
-                'pill_acc': f'{cls_acc_meter.avg:.4f}'
+                'pill_top1': f'{cls_acc_meter.avg:.4f}',
+                'pill_top5': f'{cls_acc_top5_meter.avg:.4f}'
             })
             pbar.update(1)
     
@@ -1306,7 +1336,8 @@ def validate(
             script_loss_meter.sum, script_loss_meter.count,
             cls_loss_meter.sum, cls_loss_meter.count,
             script_acc_meter.sum, script_acc_meter.count,
-            cls_acc_meter.sum, cls_acc_meter.count
+            cls_acc_meter.sum, cls_acc_meter.count,
+            cls_acc_top5_meter.sum, cls_acc_top5_meter.count
         ], device=ddp.device, dtype=torch.float64)
         
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
@@ -1316,7 +1347,8 @@ def validate(
             'script_loss': metrics_tensor[2].item() / max(metrics_tensor[3].item(), 1),
             'resnet_loss': metrics_tensor[4].item() / max(metrics_tensor[5].item(), 1),
             'script_acc': metrics_tensor[6].item() / max(metrics_tensor[7].item(), 1),
-            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1)
+            'pill_acc': metrics_tensor[8].item() / max(metrics_tensor[9].item(), 1),
+            'pill_acc_top5': metrics_tensor[10].item() / max(metrics_tensor[11].item(), 1)
         }
     
     return {
@@ -1324,7 +1356,8 @@ def validate(
         'script_loss': script_loss_meter.avg,
         'resnet_loss': cls_loss_meter.avg,
         'script_acc': script_acc_meter.avg,
-        'pill_acc': cls_acc_meter.avg
+        'pill_acc': cls_acc_meter.avg,
+        'pill_acc_top5': cls_acc_top5_meter.avg
     }
 
 
@@ -1573,11 +1606,12 @@ def main():
         
         logger.info(
             f"Train | "
-            f"Total Loss: {train_metrics['total_loss']:.4f} | "
+            f"Loss: {train_metrics['total_loss']:.4f} | "
             f"Script Loss: {train_metrics['script_loss']:.4f} | "
             f"ResNet Loss: {train_metrics['resnet_loss']:.4f} | "
             f"Script Acc: {train_metrics['script_acc']:.4f} | "
-            f"Pill Acc: {train_metrics['pill_acc']:.4f}"
+            f"Pill Top1: {train_metrics['pill_acc']:.4f} | "
+            f"Pill Top5: {train_metrics['pill_acc_top5']:.4f}"
         )
         
         # Validate
@@ -1586,11 +1620,12 @@ def main():
             
             logger.info(
                 f"Val   | "
-                f"Total Loss: {val_metrics['total_loss']:.4f} | "
+                f"Loss: {val_metrics['total_loss']:.4f} | "
                 f"Script Loss: {val_metrics['script_loss']:.4f} | "
                 f"ResNet Loss: {val_metrics['resnet_loss']:.4f} | "
                 f"Script Acc: {val_metrics['script_acc']:.4f} | "
-                f"Pill Acc: {val_metrics['pill_acc']:.4f}"
+                f"Pill Top1: {val_metrics['pill_acc']:.4f} | "
+                f"Pill Top5: {val_metrics['pill_acc_top5']:.4f}"
             )
             
             is_best = val_metrics['script_acc'] > best_script_acc
