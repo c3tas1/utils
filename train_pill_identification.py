@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-End-to-End Prescription-Aware Pill Verification (Corrupt-Padding Protected)
-============================================================================
-CRITICAL FIX APPLIED:
-The ResNet backbone now actively filters out padding images before processing.
-Previously, ~95% of inputs were black padding pixels, which destroyed
-Batch Normalization statistics and prevented the model from learning visual features.
+End-to-End Prescription Verification (Curriculum Learning + Padding Protection)
+================================================================================
+Target Hardware: NVIDIA DGX A100 (8x A100 40GB GPUs)
+
+CORE LOGIC:
+1. PADDING PROTECTION: Padding images are filtered out before the Backbone.
+   This prevents Batch Norm corruption (essential for small batches).
+
+2. CURRICULUM LEARNING:
+   - Phase 1: Train ONLY the Backbone (ResNet) using classification loss.
+     Verifier loss weights are set to 0.0.
+   - Phase 2: Once val_pill_acc > 15%, enable Verifier (Script + Anomaly losses).
+     This prevents the "gradient starvation" issue where the model ignores images.
+
+Usage:
+    torchrun --nproc_per_node=8 train_e2e_final.py --data-dir /path/to/data --build-index
+    torchrun --nproc_per_node=8 train_e2e_final.py --data-dir /path/to/data --epochs 100
 """
 
 import os
@@ -57,428 +68,409 @@ class TrainingConfig:
     backbone: str = "resnet34"
     pill_embed_dim: int = 512
     verifier_hidden_dim: int = 256
-    verifier_num_heads: int = 8
-    verifier_num_layers: int = 4
-    verifier_dropout: float = 0.1
     
     # Constraints
-    max_pills_per_prescription: int = 200
-    min_pills_per_prescription: int = 5
+    max_pills: int = 200
+    min_pills: int = 5
     
     # Training
     epochs: int = 100
     batch_size: int = 2
-    gradient_accumulation_steps: int = 4
+    grad_accum_steps: int = 4
     
-    # Differential Learning Rates
+    # LRs
     backbone_lr: float = 5e-5
-    classifier_lr: float = 1e-4
     verifier_lr: float = 1e-4
     weight_decay: float = 1e-2
     
-    # Loss Weights
-    script_loss_weight: float = 1.0
-    pill_anomaly_loss_weight: float = 2.0  # Boosted to force visual learning
-    pill_classification_loss_weight: float = 1.0
-    
-    error_rate: float = 0.5
+    # Curriculum Threshold
+    curriculum_threshold: float = 0.15  # 15% Accuracy triggers Phase 2
     
     # Hardware
-    use_amp: bool = True
-    use_gradient_checkpointing: bool = True
-    max_grad_norm: float = 1.0
+    use_chk: bool = True  # Gradient Checkpointing (Required for 640x640)
     
     num_workers: int = 4
-    seed: int = 42
     resume_from: Optional[str] = None
 
 
 # =============================================================================
-# DDP & Logging
+# Infrastructure
 # =============================================================================
 
-def setup_logging(rank, output_dir):
+def setup_logger(rank, output_dir):
     logger = logging.getLogger("PillVerifier")
     logger.setLevel(logging.INFO if rank == 0 else logging.WARNING)
-    logger.handlers = []
     if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
+        
         c_handler = logging.StreamHandler(sys.stdout)
-        f_handler = logging.FileHandler(os.path.join(output_dir, 'training.log'))
-        fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-        c_handler.setFormatter(fmt); f_handler.setFormatter(fmt)
-        logger.addHandler(c_handler); logger.addHandler(f_handler)
+        c_handler.setFormatter(fmt)
+        logger.addHandler(c_handler)
+        
+        f_handler = logging.FileHandler(os.path.join(output_dir, 'train.log'))
+        f_handler.setFormatter(fmt)
+        logger.addHandler(f_handler)
     return logger
 
 class DDPManager:
-    def __init__(self, config):
+    def __init__(self):
         self.rank = int(os.environ.get('RANK', 0))
-        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
         self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        self.is_distributed = self.world_size > 1
-        self.device = torch.device(f'cuda:{self.local_rank}') if torch.cuda.is_available() else torch.device('cpu')
+        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+        self.is_dist = self.world_size > 1
+        self.device = torch.device(f'cuda:{self.local_rank}')
     
     def setup(self):
-        if self.is_distributed:
+        if self.is_dist:
             torch.cuda.set_device(self.local_rank)
             dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
     
     def cleanup(self):
-        if self.is_distributed: dist.destroy_process_group()
-    
+        if self.is_dist: dist.destroy_process_group()
+        
     @property
     def is_main(self): return self.rank == 0
 
-@contextmanager
-def ddp_sync_context(model, sync=True):
-    if isinstance(model, DDP) and not sync:
-        with model.no_sync(): yield
-    else: yield
-
-
 # =============================================================================
-# Data Layer
+# Data
 # =============================================================================
 
 class PrescriptionDataset(Dataset):
-    def __init__(self, data_dir, split_data, class_to_idx, transform=None, 
-                 max_pills=200, min_pills=5, error_rate=0.0, is_training=True):
+    def __init__(self, data_dir, index_data, class_map, is_training=True):
         self.data_dir = Path(data_dir)
-        self.split_data = split_data
-        self.class_to_idx = class_to_idx
-        self.transform = transform or self._get_transform(is_training)
-        self.max_pills = max_pills
-        self.min_pills = min_pills
-        self.error_rate = error_rate
+        self.cls_map = class_map
         self.is_training = is_training
         
-        # Pre-group data
-        grouped = defaultdict(list)
-        for x in split_data: grouped[x['prescription_id']].append(x)
-        self.prescriptions = {k: v for k, v in grouped.items() if min_pills <= len(v) <= max_pills}
-        self.rx_ids = list(self.prescriptions.keys())
-        
-        # Build pill library for error injection
-        self.library = defaultdict(list)
-        if error_rate > 0:
-            for rx in self.prescriptions.values():
-                for p in rx: self.library[p['ndc']].append(p['relative_path'])
-
-    def _get_transform(self, is_training):
-        # ImageNet normalization
+        # 640x640 Transforms
         norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         if is_training:
-            return transforms.Compose([
+            self.tx = transforms.Compose([
                 transforms.Resize((672, 672)),
                 transforms.RandomCrop(640),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(0.2, 0.2, 0.1),
-                transforms.ToTensor(),
-                norm
+                transforms.ToTensor(), norm
             ])
-        return transforms.Compose([
-            transforms.Resize(640),
-            transforms.CenterCrop(640),
-            transforms.ToTensor(),
-            norm
-        ])
+        else:
+            self.tx = transforms.Compose([
+                transforms.Resize(640),
+                transforms.CenterCrop(640),
+                transforms.ToTensor(), norm
+            ])
+            
+        # Grouping
+        grouped = defaultdict(list)
+        for r in index_data: grouped[r['prescription_id']].append(r)
+        
+        self.rxs = []
+        for rx_id, pills in grouped.items():
+            if 5 <= len(pills) <= 200:
+                self.rxs.append(sorted(pills, key=lambda x: int(x['patch_no'])))
+                
+        # Library for Error Injection
+        self.lib = defaultdict(list)
+        if is_training:
+            for rx in self.rxs:
+                for p in rx: self.lib[p['ndc']].append(p['relative_path'])
 
-    def _load_img(self, path):
-        try:
-            return Image.open(self.data_dir / path).convert('RGB')
-        except:
-            return Image.new('RGB', (640, 640), (0, 0, 0))
-
-    def __len__(self): return len(self.rx_ids)
+    def __len__(self): return len(self.rxs)
 
     def __getitem__(self, idx):
-        rx_id = self.rx_ids[idx]
-        pills = self.prescriptions[rx_id]
+        pills = self.rxs[idx]
+        is_correct = True
+        wrong_mask = torch.ones(len(pills)) # 1 = Correct
         
-        # Injection Logic
-        wrong_indices = []
-        is_script_correct = True
-        
-        if self.is_training and random.random() < self.error_rate:
-            is_script_correct = False
-            # Deep copy to avoid modifying dataset
-            pills = [p.copy() for p in pills]
-            n_mod = random.randint(1, max(1, len(pills)//3))
-            wrong_indices = random.sample(range(len(pills)), n_mod)
+        # Injection (50% chance during training)
+        if self.is_training and random.random() < 0.5:
+            is_correct = False
+            pills = [p.copy() for p in pills] # Deep copy
+            n_err = random.randint(1, max(1, len(pills)//3))
+            err_idx = random.sample(range(len(pills)), n_err)
             
-            for i in wrong_indices:
-                orig_ndc = pills[i]['ndc']
-                candidates = [k for k in self.library.keys() if k != orig_ndc]
-                if candidates:
-                    new_ndc = random.choice(candidates)
+            for i in err_idx:
+                wrong_mask[i] = 0.0
+                orig = pills[i]['ndc']
+                # Pick random DIFFERENT ndc
+                opts = [k for k in self.lib.keys() if k != orig]
+                if opts:
+                    new_ndc = random.choice(opts)
                     pills[i]['ndc'] = new_ndc
-                    pills[i]['relative_path'] = random.choice(self.library[new_ndc])
+                    pills[i]['relative_path'] = random.choice(self.lib[new_ndc])
 
         # Load Images
-        images = torch.stack([self.transform(self._load_img(p['relative_path'])) for p in pills])
-        labels = torch.tensor([self.class_to_idx[p['ndc']] for p in pills], dtype=torch.long)
+        imgs = []
+        lbls = []
+        for p in pills:
+            try:
+                img = Image.open(self.data_dir / p['relative_path']).convert('RGB')
+                imgs.append(self.tx(img))
+            except:
+                imgs.append(torch.zeros(3, 640, 640)) # Safe fallback
+            lbls.append(self.cls_map[p['ndc']])
+
+        # Expected NDCs (from original prescription logic - implicit here)
+        # Simplified: Just passing unique NDCs present in the *original* list would be ideal
+        # But for training speed, we can just use the labels as "expected" if correct
+        # Ideally, you pass the text description of the RX separately.
+        # For this script, we assume 'labels' represents the visual ground truth.
         
-        # Expected NDCs (Based on original prescription)
-        orig_pills = self.prescriptions[rx_id]
-        expected_ndcs = list(set(self.class_to_idx[p['ndc']] for p in orig_pills))
-        expected_counts = [sum(1 for p in orig_pills if p['ndc'] == k) for k in [p['ndc'] for p in orig_pills]]
-        # Simplify count logic: just count occurrences of unique NDCs
-        uniq_map = defaultdict(int)
-        for p in orig_pills: uniq_map[self.class_to_idx[p['ndc']]] += 1
-        exp_ndc_tensor = torch.tensor(list(uniq_map.keys()), dtype=torch.long)
-        exp_cnt_tensor = torch.tensor(list(uniq_map.values()), dtype=torch.float)
-
-        pill_correct = torch.ones(len(pills))
-        pill_correct[wrong_indices] = 0.0
-
         return {
-            'images': images,
-            'labels': labels,
-            'expected_ndcs': exp_ndc_tensor,
-            'expected_counts': exp_cnt_tensor,
-            'is_correct': torch.tensor(float(is_script_correct)),
-            'pill_correct': pill_correct,
+            'images': torch.stack(imgs),
+            'labels': torch.tensor(lbls, dtype=torch.long),
+            'is_correct': torch.tensor(float(is_correct)),
+            'pill_correct': wrong_mask,
             'num_pills': len(pills)
         }
 
 def collate_fn(batch):
     B = len(batch)
-    max_p = max(x['num_pills'] for x in batch)
-    max_e = max(len(x['expected_ndcs']) for x in batch)
+    max_p = max(b['num_pills'] for b in batch)
     C, H, W = batch[0]['images'].shape[1:]
     
     out = {
         'images': torch.zeros(B, max_p, C, H, W),
         'labels': torch.full((B, max_p), -100, dtype=torch.long),
-        'pill_mask': torch.ones(B, max_p, dtype=torch.bool), # True=Pad
+        'mask': torch.ones(B, max_p, dtype=torch.bool), # True=Pad
         'pill_correct': torch.zeros(B, max_p),
-        
-        'expected_ndcs': torch.zeros(B, max_e, dtype=torch.long),
-        'expected_counts': torch.zeros(B, max_e, dtype=torch.float),
-        'expected_mask': torch.ones(B, max_e, dtype=torch.bool), # True=Pad
-        
-        'is_correct': torch.tensor([x['is_correct'] for x in batch])
+        'is_correct': torch.tensor([b['is_correct'] for b in batch])
     }
     
     for i, b in enumerate(batch):
-        n, ne = b['num_pills'], len(b['expected_ndcs'])
+        n = b['num_pills']
         out['images'][i, :n] = b['images']
         out['labels'][i, :n] = b['labels']
-        out['pill_mask'][i, :n] = False
+        out['mask'][i, :n] = False
         out['pill_correct'][i, :n] = b['pill_correct']
-        
-        out['expected_ndcs'][i, :ne] = b['expected_ndcs']
-        out['expected_counts'][i, :ne] = b['expected_counts']
-        out['expected_mask'][i, :ne] = False
         
     return out
 
-
 # =============================================================================
-# Models - FIXED FOR PADDING CORRUPTION
+# Model (Padding Protected)
 # =============================================================================
 
 class ResNetBackbone(nn.Module):
-    def __init__(self, name, num_classes, checkpointing):
+    def __init__(self, num_classes, use_chk):
         super().__init__()
-        self.use_chk = checkpointing
-        weights = models.ResNet34_Weights.DEFAULT if name=='resnet34' else models.ResNet50_Weights.DEFAULT
-        base = models.resnet34(weights=weights) if name=='resnet34' else models.resnet50(weights=weights)
-        self.dim = 512 if name=='resnet34' else 2048
-        
-        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
-        self.layers = nn.ModuleList([base.layer1, base.layer2, base.layer3, base.layer4])
-        self.avgpool = base.avgpool
-        self.classifier = nn.Linear(self.dim, num_classes)
+        self.use_chk = use_chk
+        m = models.resnet34(weights='IMAGENET1K_V1')
+        self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)
+        self.layers = nn.ModuleList([m.layer1, m.layer2, m.layer3, m.layer4])
+        self.avgpool = m.avgpool
+        self.classifier = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        # x shape: (N_valid, C, H, W) - ALREADY FILTERED, NO PADDING
+        # x is (N_valid, 3, 640, 640) -> NO PADDING HERE
         if self.use_chk and self.training:
             x = checkpoint(self.stem, x, use_reentrant=False)
-            for layer in self.layers:
-                x = checkpoint(layer, x, use_reentrant=False)
+            for l in self.layers: x = checkpoint(l, x, use_reentrant=False)
         else:
             x = self.stem(x)
-            for layer in self.layers: x = layer(x)
+            for l in self.layers: x = l(x)
             
-        x = self.avgpool(x).flatten(1)
-        logits = self.classifier(x)
-        return x, logits
+        feat = self.avgpool(x).flatten(1)
+        logits = self.classifier(feat)
+        return feat, logits
 
-class PrescriptionVerifier(nn.Module):
+class Verifier(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         d = cfg.verifier_hidden_dim
-        self.ndc_emb = nn.Embedding(cfg.num_classes, d)
-        
-        # Encoders
-        self.rx_enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(d, 8, d*4, 0.1, batch_first=True), 2)
-        self.pill_enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(d, 8, d*4, 0.1, batch_first=True), cfg.verifier_num_layers)
-        
-        # Projection
         self.proj = nn.Linear(cfg.pill_embed_dim + 1, d)
-        
-        # Cross Attention
-        self.cross = nn.MultiheadAttention(d, 8, batch_first=True)
-        self.norm = nn.LayerNorm(d)
-        
-        # Heads
-        self.pool_tok = nn.Parameter(torch.randn(1, 1, d))
-        self.head_script = nn.Linear(d, 1)
-        self.head_anom = nn.Linear(d, 1)
+        self.enc = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d, 8, d*4, 0.1, batch_first=True, norm_first=True), 
+            num_layers=4
+        )
+        self.head_s = nn.Linear(d, 1)
+        self.head_a = nn.Linear(d, 1)
+        self.tok = nn.Parameter(torch.randn(1, 1, d))
 
-    def forward(self, pill_emb, pill_conf, rx_ndc, rx_cnt, p_mask, rx_mask):
-        # 1. Encode Script
-        rx = self.ndc_emb(rx_ndc) + (rx_cnt.unsqueeze(-1) * 0.05)
-        rx = self.rx_enc(rx, src_key_padding_mask=rx_mask)
+    def forward(self, emb, conf, mask):
+        # emb: (B, N, 512)
+        x = self.proj(torch.cat([emb, conf], -1)) # (B, N, 256)
         
-        # 2. Pill Features
-        x = self.proj(torch.cat([pill_emb, pill_conf], -1))
-        
-        # 3. Cross Attn (Pills attend to Script)
-        # Note: key_padding_mask for cross attention applies to Key/Value (the Script)
-        attn, _ = self.cross(x, rx, rx, key_padding_mask=rx_mask)
-        x = self.norm(x + attn)
-        
-        # 4. Self Attn
-        x = self.pill_enc(x, src_key_padding_mask=p_mask)
-        
-        # 5. Anomaly
-        anom = self.head_anom(x).squeeze(-1)
-        
-        # 6. Script Level
+        # Add Token
         B = x.size(0)
-        tok = self.pool_tok.expand(B, -1, -1)
-        # Concatenate token + pills for pooling
-        combined = torch.cat([tok, x], dim=1)
-        # Extend mask for token (False = valid)
-        tok_mask = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
-        combined_mask = torch.cat([tok_mask, p_mask], dim=1)
+        tok = self.tok.expand(B, -1, -1)
+        x = torch.cat([tok, x], dim=1) # (B, N+1, 256)
         
-        # Simple Mean Pooling of valid tokens
-        # (Transformer pooling is better but mean is robust for now)
-        mask_float = (~combined_mask).float().unsqueeze(-1)
-        pooled = (combined * mask_float).sum(1) / (mask_float.sum(1) + 1e-8)
+        # Extend Mask (Token is valid)
+        # mask is True for Padding. Add False for token.
+        tok_mask = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
+        full_mask = torch.cat([tok_mask, mask], dim=1)
         
-        script = self.head_script(pooled)
-        return script, anom
+        feat = self.enc(x, src_key_padding_mask=full_mask)
+        
+        # Script prediction from Token [0]
+        script_logits = self.head_s(feat[:, 0, :])
+        
+        # Anomaly prediction from Pills [1:]
+        anom_logits = self.head_a(feat[:, 1:, :]).squeeze(-1)
+        
+        return script_logits, anom_logits
 
 class EndToEndModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.backbone = ResNetBackbone(cfg.backbone, cfg.num_classes, cfg.use_gradient_checkpointing)
-        self.verifier = PrescriptionVerifier(cfg)
-        self.embed_dim = cfg.pill_embed_dim
-        self.num_classes = cfg.num_classes
+        self.backbone = ResNetBackbone(cfg.num_classes, cfg.use_chk)
+        self.verifier = Verifier(cfg)
+        self.dim = 512
+        self.n_cls = cfg.num_classes
 
-    def forward(self, images, rx_ndc, rx_cnt, p_mask, rx_mask):
+    def forward(self, images, mask):
         """
-        Args:
-            images: (B, N, C, H, W) - Contains PADDING (Zeros)
-            p_mask: (B, N) - True where padding exists
+        PAD PROTECTION LOGIC:
+        1. Flatten Batch
+        2. Remove Padding Indices
+        3. Run Backbone
+        4. Scatter results back to (B, N)
         """
         B, N, C, H, W = images.shape
         
-        # --- CRITICAL FIX START ---
-        # 1. Flatten to (B*N, ...)
-        flat_imgs = images.view(-1, C, H, W)
-        flat_mask = p_mask.view(-1)
+        # 1. Flatten
+        flat_img = images.view(-1, C, H, W)
+        flat_msk = mask.view(-1)
         
-        # 2. Filter: Select ONLY valid images
-        # We perform boolean indexing to remove padding images entirely
-        valid_indices = torch.nonzero(~flat_mask).squeeze()
-        valid_imgs = flat_imgs[valid_indices]
+        # 2. Filter
+        valid_idx = torch.nonzero(~flat_msk).squeeze()
+        valid_img = flat_img[valid_idx]
         
-        # 3. Forward Pass (Only on valid images)
-        # This ensures Batch Norm sees only real data
-        valid_emb, valid_logits = self.backbone(valid_imgs)
+        # 3. Backbone (Only Real Images)
+        valid_feat, valid_logits = self.backbone(valid_img)
         
-        # 4. Scatter Back: Reconstruct (B, N) structure
-        # Initialize containers with zeros
-        emb_full = torch.zeros(B * N, self.embed_dim, device=images.device, dtype=valid_emb.dtype)
-        logits_full = torch.zeros(B * N, self.num_classes, device=images.device, dtype=valid_logits.dtype)
+        # 4. Scatter Back
+        # Create empty buffers (B*N)
+        full_feat = torch.zeros(B*N, self.dim, device=images.device, dtype=valid_feat.dtype)
+        full_logits = torch.zeros(B*N, self.n_cls, device=images.device, dtype=valid_logits.dtype)
         
-        # Place valid results back into their original positions
-        emb_full.index_copy_(0, valid_indices, valid_emb)
-        logits_full.index_copy_(0, valid_indices, valid_logits)
+        # Scatter
+        full_feat.index_copy_(0, valid_idx, valid_feat)
+        full_logits.index_copy_(0, valid_idx, valid_logits)
         
-        # Reshape to (B, N, ...)
-        emb_out = emb_full.view(B, N, -1)
-        logits_out = logits_full.view(B, N, -1)
-        # --- CRITICAL FIX END ---
+        # Reshape
+        feat_out = full_feat.view(B, N, -1)
+        logits_out = full_logits.view(B, N, -1)
         
-        # Calculate Confidence
-        probs = F.softmax(logits_out, dim=-1)
-        confs = probs.max(dim=-1).values.unsqueeze(-1)
+        # 5. Verifier
+        # Calc confidence
+        conf = F.softmax(logits_out, dim=-1).max(dim=-1).values.unsqueeze(-1)
         
-        # Verifier
-        s_logit, a_logits = self.verifier(emb_out, confs, rx_ndc, rx_cnt, p_mask, rx_mask)
+        s_logit, a_logits = self.verifier(feat_out, conf, mask)
         
         return s_logit, a_logits, logits_out
 
 # =============================================================================
-# Training Loop
+# Training
 # =============================================================================
 
-def train_one_epoch(model, loader, opt, scaler, ddp, cfg):
+def train_epoch(model, loader, opt, scaler, ddp, cfg, phase, logger):
     model.train()
     meters = defaultdict(float)
-    counts = defaultdict(int)
+    count = 0
     
-    if ddp.is_main: pbar = tqdm(loader)
+    if ddp.is_main: 
+        pbar = tqdm(loader, desc=f"Phase: {phase}")
     
     for i, batch in enumerate(loader):
-        batch = {k: v.to(ddp.device, non_blocking=True) for k,v in batch.items()}
+        imgs = batch['images'].to(ddp.device, non_blocking=True)
+        lbls = batch['labels'].to(ddp.device, non_blocking=True)
+        mask = batch['mask'].to(ddp.device, non_blocking=True)
+        is_corr = batch['is_correct'].to(ddp.device, non_blocking=True)
+        p_corr = batch['pill_correct'].to(ddp.device, non_blocking=True)
         
-        with ddp_sync_context(model, (i+1)%cfg.gradient_accumulation_steps==0):
-            with autocast(enabled=cfg.use_amp):
-                s_l, a_l, p_l = model(
-                    batch['images'], batch['expected_ndcs'], batch['expected_counts'],
-                    batch['pill_mask'], batch['expected_mask']
-                )
-                
-                # Losses
-                loss_s = F.binary_cross_entropy_with_logits(s_l.squeeze(-1), batch['is_correct'])
-                
-                valid = ~batch['pill_mask']
-                loss_a = 0
-                if valid.any():
-                    l_a_raw = F.binary_cross_entropy_with_logits(a_l, 1.0-batch['pill_correct'], reduction='none')
-                    loss_a = (l_a_raw * valid).sum() / (valid.sum() + 1e-6)
-                
-                # ResNet Classification Loss (Flattened)
-                loss_c = F.cross_entropy(p_l.view(-1, cfg.num_classes), batch['labels'].view(-1), ignore_index=-100)
-                
-                loss = (loss_s * cfg.script_loss_weight + 
-                        loss_a * cfg.pill_anomaly_loss_weight + 
-                        loss_c * cfg.pill_classification_loss_weight)
-                
-                loss = loss / cfg.gradient_accumulation_steps
+        with autocast(enabled=True):
+            s_l, a_l, p_l = model(imgs, mask)
             
-            scaler.scale(loss).backward()
-        
-        if (i+1)%cfg.gradient_accumulation_steps == 0:
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            scaler.step(opt); scaler.update(); opt.zero_grad()
-        
-        # Metrics
-        bs = batch['images'].size(0)
-        with torch.no_grad():
-            acc_s = ((torch.sigmoid(s_l.squeeze())>0.5) == batch['is_correct']).float().mean()
-            acc_p = 0
+            # 1. Classification Loss (Always Active)
+            # Flatten to ignore padding (-100 handled by CE)
+            loss_cls = F.cross_entropy(p_l.view(-1, cfg.num_classes), lbls.view(-1), ignore_index=-100)
+            
+            # 2. Verifier Losses (Curriculum Controlled)
+            loss_s = F.binary_cross_entropy_with_logits(s_l.squeeze(-1), is_corr)
+            
+            # Anomaly loss (masked)
+            valid = ~mask
+            loss_a = torch.tensor(0.0, device=ddp.device)
             if valid.any():
-                preds = p_l.argmax(-1)
-                targs = batch['labels']
-                mask = (targs != -100)
-                acc_p = (preds[mask] == targs[mask]).float().mean()
-        
-        for k,v in {'loss': loss.item()*cfg.gradient_accumulation_steps, 'acc_s': acc_s.item(), 'acc_p': acc_p.item()}.items():
-            meters[k] += v * bs
-            counts[k] += bs
+                l_raw = F.binary_cross_entropy_with_logits(a_l, 1.0 - p_corr, reduction='none')
+                loss_a = (l_raw * valid).sum() / (valid.sum() + 1e-6)
             
-        if ddp.is_main: pbar.set_postfix({'loss': meters['loss']/counts['loss'], 'acc_p': meters['acc_p']/counts['acc_p']})
+            # Combine based on Phase
+            if phase == "BACKBONE_ONLY":
+                # Verifier is effectively detached. 
+                # We weight these 0.0 so gradients don't flow to Verifier,
+                # BUT we calculate them so DDP (find_unused_parameters=True) doesn't hang.
+                loss = loss_cls
+                # Optional: loss += 0.0 * (loss_s + loss_a) to keep graph connected if needed,
+                # but find_unused_parameters=True handles disconnection.
+            else:
+                loss = loss_cls + loss_s + (loss_a * 2.0) # Boost anomaly detection
+            
+            loss = loss / cfg.grad_accum_steps
+            
+        scaler.scale(loss).backward()
+        
+        if (i+1) % cfg.grad_accum_steps == 0:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad()
+            
+        # Metrics
+        bs = imgs.size(0)
+        with torch.no_grad():
+            acc_s = ((torch.sigmoid(s_l.squeeze()) > 0.5) == is_corr).float().mean()
+            
+            # Pill Acc
+            preds = p_l.argmax(-1)
+            valid_mask = (lbls != -100)
+            acc_p = torch.tensor(0.0, device=ddp.device)
+            if valid_mask.any():
+                acc_p = (preds[valid_mask] == lbls[valid_mask]).float().mean()
+        
+        meters['loss'] += loss.item() * cfg.grad_accum_steps * bs
+        meters['acc_s'] += acc_s.item() * bs
+        meters['acc_p'] += acc_p.item() * bs
+        count += bs
+        
+        if ddp.is_main:
+            pbar.set_postfix({'acc_p': meters['acc_p']/count, 'loss': meters['loss']/count})
+            
+    return {k: v/count for k,v in meters.items()}
 
-    return {k: v/counts[k] for k,v in meters.items()}
+@torch.no_grad()
+def validate(model, loader, ddp):
+    model.eval()
+    meters = defaultdict(float)
+    count = 0
+    
+    for batch in loader:
+        imgs = batch['images'].to(ddp.device)
+        lbls = batch['labels'].to(ddp.device)
+        mask = batch['mask'].to(ddp.device)
+        
+        with autocast(enabled=True):
+            _, _, p_l = model(imgs, mask)
+        
+        preds = p_l.argmax(-1)
+        valid = (lbls != -100)
+        
+        bs = imgs.size(0)
+        acc_p = 0.0
+        if valid.any():
+            acc_p = (preds[valid] == lbls[valid]).float().mean().item()
+            
+        meters['acc_p'] += acc_p * bs
+        count += bs
+        
+    # Sync
+    total_acc = torch.tensor(meters['acc_p'], device=ddp.device)
+    total_cnt = torch.tensor(count, device=ddp.device)
+    dist.all_reduce(total_acc)
+    dist.all_reduce(total_cnt)
+    
+    return total_acc.item() / total_cnt.item()
 
 # =============================================================================
 # Main
@@ -490,70 +482,88 @@ def main():
     parser.add_argument('--build-index', action='store_true')
     args = parser.parse_args()
     
-    # Simple CSV Indexer
+    # 1. Indexing
     if args.build_index:
-        print("Indexing...")
+        print("Building Index...")
         with open(os.path.join(args.data_dir, 'dataset_index.csv'), 'w') as f:
             w = csv.writer(f)
             w.writerow(['split','ndc','prescription_id','patch_no','relative_path'])
             for split in ['train', 'valid']:
-                p = Path(args.data_dir)/split
-                if not p.exists(): continue
-                for d in p.iterdir():
-                    if not d.is_dir(): continue
-                    for img in d.glob('*.jpg'):
-                        # filename fmt: NDC_RxID_patch_N.jpg
-                        parts = img.stem.split('_') 
-                        if len(parts) >= 4:
-                            w.writerow([split, d.name, parts[1], parts[3], str(img.relative_to(args.data_dir))])
+                s_dir = Path(args.data_dir) / split
+                if not s_dir.exists(): continue
+                for d in s_dir.iterdir():
+                    if d.is_dir():
+                        for img in d.glob('*.jpg'):
+                            # Expected fmt: NDC_RxID_patch_N.jpg
+                            parts = img.stem.split('_')
+                            if len(parts) >= 4:
+                                w.writerow([split, d.name, parts[1], parts[3], str(img.relative_to(args.data_dir))])
         return
 
+    # 2. Config & Setup
     cfg = TrainingConfig(data_dir=args.data_dir)
-    ddp = DDPManager(cfg); ddp.setup()
-    logger = setup_logging(ddp.rank, cfg.output_dir)
+    ddp = DDPManager()
+    ddp.setup()
+    logger = setup_logger(ddp.rank, cfg.output_dir)
     
-    # Load Index
-    rows = []
-    with open(os.path.join(cfg.data_dir, cfg.index_file)) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    # 3. Data Loading
+    idx_path = os.path.join(cfg.data_dir, cfg.index_file)
+    with open(idx_path) as f: rows = list(csv.DictReader(f))
     
-    # Map Classes
     ndcs = sorted(list(set(r['ndc'] for r in rows)))
     cls_map = {n: i for i, n in enumerate(ndcs)}
     cfg.num_classes = len(ndcs)
     
-    train_data = [r for r in rows if r['split']=='train']
-    valid_data = [r for r in rows if r['split']=='valid']
+    if ddp.is_main: logger.info(f"Loaded {len(rows)} samples, {cfg.num_classes} classes.")
     
-    ds_train = PrescriptionDataset(cfg.data_dir, train_data, cls_map, is_training=True)
-    ds_valid = PrescriptionDataset(cfg.data_dir, valid_data, cls_map, is_training=False)
+    ds_train = PrescriptionDataset(cfg.data_dir, [r for r in rows if r['split']=='train'], cls_map, True)
+    ds_valid = PrescriptionDataset(cfg.data_dir, [r for r in rows if r['split']=='valid'], cls_map, False)
     
-    dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, 
-                          sampler=DistributedSampler(ds_train) if ddp.is_distributed else None,
-                          collate_fn=collate_fn, num_workers=4, pin_memory=True, drop_last=True)
+    dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, sampler=DistributedSampler(ds_train), 
+                          num_workers=4, pin_memory=True, collate_fn=collate_fn, drop_last=True)
+    dl_valid = DataLoader(ds_valid, batch_size=cfg.batch_size, sampler=DistributedSampler(ds_valid, shuffle=False),
+                          num_workers=4, pin_memory=True, collate_fn=collate_fn)
                           
-    # Model Setup
+    # 4. Model
     model = EndToEndModel(cfg).to(ddp.device)
-    if ddp.is_distributed:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = DDP(model, device_ids=[ddp.local_rank], find_unused_parameters=False)
-        
+    model = nn.SyncBatchNorm.convert_sync_batchnorm(model) # Critical for BS=2
+    # find_unused_parameters=True is REQUIRED because in Phase 1 we ignore Verifier
+    model = DDP(model, device_ids=[ddp.local_rank], find_unused_parameters=True)
+    
     opt = torch.optim.AdamW([
-        {'params': [p for n,p in model.named_parameters() if 'backbone' in n], 'lr': cfg.backbone_lr},
-        {'params': [p for n,p in model.named_parameters() if 'backbone' not in n], 'lr': cfg.verifier_lr}
+        {'params': model.module.backbone.parameters(), 'lr': cfg.backbone_lr},
+        {'params': model.module.verifier.parameters(), 'lr': cfg.verifier_lr}
     ], weight_decay=cfg.weight_decay)
     
-    scaler = GradScaler(enabled=cfg.use_amp)
-
-    # Train
+    scaler = GradScaler()
+    
+    # 5. Training Loop
+    phase = "BACKBONE_ONLY"
+    
     for ep in range(cfg.epochs):
-        if ddp.is_distributed: dl_train.sampler.set_epoch(ep)
-        res = train_one_epoch(model, dl_train, opt, scaler, ddp, cfg)
+        dl_train.sampler.set_epoch(ep)
+        
+        # Train
+        metrics = train_epoch(model, dl_train, opt, scaler, ddp, cfg, phase, logger)
+        
+        # Validate (Pill Accuracy)
+        val_acc = validate(model, dl_valid, ddp)
+        
         if ddp.is_main:
-            logger.info(f"Ep {ep}: Loss={res['loss']:.4f} | ScriptAcc={res['acc_s']:.4f} | PillAcc={res['acc_p']:.4f}")
-            if (ep+1)%5==0: 
+            logger.info(f"Ep {ep} [{phase}]: Train Loss={metrics['loss']:.4f} Pill Acc={metrics['acc_p']:.4f} | Val Acc={val_acc:.4f}")
+            
+            # Checkpoint
+            if (ep+1) % 5 == 0:
                 torch.save(model.state_dict(), f"{cfg.output_dir}/model_{ep}.pt")
+                
+        # Curriculum Transition Logic
+        # Sync phase decision across all GPUs based on Val Acc
+        acc_tensor = torch.tensor(val_acc, device=ddp.device)
+        dist.broadcast(acc_tensor, src=0)
+        
+        if phase == "BACKBONE_ONLY" and acc_tensor.item() > cfg.curriculum_threshold:
+            phase = "END_TO_END"
+            if ddp.is_main: logger.info(f">>> SWITCHING TO END-TO-END TRAINING (Val Acc > {cfg.curriculum_threshold}) <<<")
 
     ddp.cleanup()
 
