@@ -259,6 +259,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--input-size', type=int, default=224)
     parser.add_argument('--num-workers', type=int, default=8)
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     args = parser.parse_args()
     
     # DDP setup
@@ -340,13 +341,46 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
     scaler = GradScaler()
     
-    # Training loop
+    # Resume from checkpoint
+    start_epoch = 0
     best_acc = 0.0
+    
+    if args.resume:
+        if os.path.exists(args.resume):
+            if rank == 0:
+                print(f"\nResuming from {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load model weights
+            if is_distributed:
+                model.module.load_state_dict(checkpoint['model'])
+            else:
+                model.load_state_dict(checkpoint['model'])
+            
+            # Load optimizer if available
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            # Load scheduler state
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_acc = checkpoint.get('val_acc', 0.0)
+            
+            # Advance scheduler to correct position
+            for _ in range(start_epoch):
+                scheduler.step()
+            
+            if rank == 0:
+                print(f"  Resumed from epoch {start_epoch}, best_acc={best_acc:.4f}")
+        else:
+            if rank == 0:
+                print(f"Warning: Resume file not found: {args.resume}")
+    
+    # Training loop
     
     if rank == 0:
         print("\nStarting training...")
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if is_distributed:
             train_sampler.set_epoch(epoch)
         
