@@ -7,7 +7,14 @@ Trains ONLY the transformer verifier with frozen backbone.
 Precomputes embeddings for maximum speed.
 
 Usage:
+    # Single GPU
     python train_phase2_verifier.py \
+        --data-dir /path/to/data \
+        --backbone output_phase1/backbone_best.pt \
+        --epochs 20
+    
+    # Multi-GPU (if needed for large datasets)
+    torchrun --nproc_per_node=8 train_phase2_verifier.py \
         --data-dir /path/to/data \
         --backbone output_phase1/backbone_best.pt \
         --epochs 20
@@ -483,7 +490,7 @@ def train_epoch(verifier, loader, optimizer, scaler, device, epoch, rank):
 
 
 @torch.no_grad()
-def validate(verifier, loader, device):
+def validate(verifier, loader, device, rank=0, is_distributed=False):
     verifier.eval()
     
     total_script_correct = 0
@@ -515,8 +522,16 @@ def validate(verifier, loader, device):
             total_anomaly_correct += ((anomaly_pred == anomaly_target) & valid).sum().item()
             total_anomaly_count += valid.sum().item()
     
+    # Sync across GPUs if distributed
+    if is_distributed:
+        stats = torch.tensor([total_script_correct, total_script_count, 
+                            total_anomaly_correct, total_anomaly_count], 
+                           device=device, dtype=torch.float64)
+        dist.all_reduce(stats)
+        total_script_correct, total_script_count, total_anomaly_correct, total_anomaly_count = stats.tolist()
+    
     return {
-        'script_acc': total_script_correct / total_script_count,
+        'script_acc': total_script_correct / max(1, total_script_count),
         'anomaly_acc': total_anomaly_correct / max(1, total_anomaly_count)
     }
 
@@ -539,21 +554,39 @@ def main():
     parser.add_argument('--error-rate', type=float, default=0.5)
     parser.add_argument('--skip-extraction', action='store_true', 
                        help='Skip embedding extraction (use cached)')
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     args = parser.parse_args()
     
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.output_dir, exist_ok=True)
-    rank = 0  # Single GPU for Phase 2 (fast enough)
+    # DDP Setup
+    is_distributed = 'RANK' in os.environ
     
-    print("=" * 60)
-    print("PHASE 2: VERIFIER TRAINING")
-    print("=" * 60)
-    print(f"Device: {device}")
-    print(f"Backbone: {args.backbone}")
+    if is_distributed:
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group('nccl', timeout=timedelta(minutes=30))
+        device = torch.device(f'cuda:{local_rank}')
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    if rank == 0:
+        print("=" * 60)
+        print("PHASE 2: VERIFIER TRAINING")
+        print("=" * 60)
+        print(f"Device: {device}")
+        print(f"World size: {world_size}")
+        print(f"Batch size: {args.batch_size} Ã {world_size} = {args.batch_size * world_size}")
+        print(f"Backbone: {args.backbone}")
     
     # Load backbone
-    print("\nLoading backbone...")
+    if rank == 0:
+        print("\nLoading backbone...")
     checkpoint = torch.load(args.backbone, map_location=device)
     num_classes = checkpoint['num_classes']
     class_to_idx = checkpoint['class_to_idx']
@@ -562,27 +595,36 @@ def main():
     backbone.load_state_dict(checkpoint['model'])
     backbone.eval()
     
-    print(f"  Loaded! Val accuracy was: {checkpoint.get('val_acc', 'N/A'):.4f}")
-    print(f"  Classes: {num_classes}")
+    if rank == 0:
+        print(f"  Loaded! Val accuracy was: {checkpoint.get('val_acc', 'N/A'):.4f}")
+        print(f"  Classes: {num_classes}")
     
-    # Extract embeddings (or load cached)
+    # Extract embeddings (only on rank 0, others wait)
     index_file = os.path.join(args.data_dir, 'dataset_index.csv')
     embeddings_file = os.path.join(args.output_dir, 'embeddings_cache.pkl')
     
-    if not args.skip_extraction or not os.path.exists(embeddings_file):
-        extract_embeddings(
-            backbone, args.data_dir, index_file, embeddings_file,
-            device, batch_size=64, input_size=args.input_size
-        )
-    else:
-        print(f"\nUsing cached embeddings: {embeddings_file}")
+    if rank == 0:
+        if not args.skip_extraction or not os.path.exists(embeddings_file):
+            extract_embeddings(
+                backbone, args.data_dir, index_file, embeddings_file,
+                device, batch_size=64, input_size=args.input_size
+            )
+        else:
+            print(f"\nUsing cached embeddings: {embeddings_file}")
+    
+    # Sync all processes after extraction
+    if is_distributed:
+        dist.barrier()
     
     # Load prescriptions
-    print("\nLoading prescriptions...")
+    if rank == 0:
+        print("\nLoading prescriptions...")
     train_prescriptions = load_prescriptions(index_file, 'train')
     val_prescriptions = load_prescriptions(index_file, 'valid')
-    print(f"  Train prescriptions: {len(train_prescriptions)}")
-    print(f"  Val prescriptions: {len(val_prescriptions)}")
+    
+    if rank == 0:
+        print(f"  Train prescriptions: {len(train_prescriptions)}")
+        print(f"  Val prescriptions: {len(val_prescriptions)}")
     
     # Datasets
     train_dataset = PrecomputedPrescriptionDataset(
@@ -594,16 +636,22 @@ def main():
         error_rate=args.error_rate, is_training=False
     )
     
+    # Samplers and DataLoaders
+    train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+    
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
+        train_dataset, batch_size=args.batch_size, 
+        sampler=train_sampler, shuffle=(train_sampler is None),
         collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
+        val_dataset, batch_size=args.batch_size, 
+        sampler=val_sampler, shuffle=False,
         collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     
-    # Verifier
+    # Verifier model
     verifier = PrescriptionVerifier(
         embed_dim=512,
         hidden_dim=args.hidden_dim,
@@ -612,54 +660,93 @@ def main():
         dropout=0.1
     ).to(device)
     
-    total_params = sum(p.numel() for p in verifier.parameters())
-    print(f"\nVerifier parameters: {total_params:,}")
+    if is_distributed:
+        verifier = DDP(verifier, device_ids=[local_rank])
+    
+    if rank == 0:
+        total_params = sum(p.numel() for p in verifier.parameters())
+        print(f"\nVerifier parameters: {total_params:,}")
     
     # Optimizer
     optimizer = torch.optim.AdamW(verifier.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
     scaler = GradScaler()
     
-    # Training
-    print("\nStarting training...")
+    # Resume from checkpoint
+    start_epoch = 0
     best_script_acc = 0.0
     
-    for epoch in range(args.epochs):
+    if args.resume and os.path.exists(args.resume):
+        if rank == 0:
+            print(f"\nResuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        
+        if is_distributed:
+            verifier.module.load_state_dict(ckpt['verifier'])
+        else:
+            verifier.load_state_dict(ckpt['verifier'])
+        
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        
+        start_epoch = ckpt.get('epoch', 0) + 1
+        best_script_acc = ckpt.get('script_acc', 0.0)
+        
+        for _ in range(start_epoch):
+            scheduler.step()
+        
+        if rank == 0:
+            print(f"  Resumed from epoch {start_epoch}, best_script_acc={best_script_acc:.4f}")
+    
+    # Training
+    if rank == 0:
+        print("\nStarting training...")
+    
+    for epoch in range(start_epoch, args.epochs):
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
+        
         train_metrics = train_epoch(verifier, train_loader, optimizer, scaler, device, epoch, rank)
-        val_metrics = validate(verifier, val_loader, device)
+        val_metrics = validate(verifier, val_loader, device, rank, is_distributed)
         scheduler.step()
         
-        print(f"\nEpoch {epoch}:")
-        print(f"  Train - Loss: {train_metrics['loss']:.4f}, Script: {train_metrics['script_acc']:.4f}, Anomaly: {train_metrics['anomaly_acc']:.4f}")
-        print(f"  Val   - Script: {val_metrics['script_acc']:.4f}, Anomaly: {val_metrics['anomaly_acc']:.4f}")
+        if rank == 0:
+            print(f"\nEpoch {epoch}:")
+            print(f"  Train - Loss: {train_metrics['loss']:.4f}, Script: {train_metrics['script_acc']:.4f}, Anomaly: {train_metrics['anomaly_acc']:.4f}")
+            print(f"  Val   - Script: {val_metrics['script_acc']:.4f}, Anomaly: {val_metrics['anomaly_acc']:.4f}")
+            
+            if val_metrics['script_acc'] > best_script_acc:
+                best_script_acc = val_metrics['script_acc']
+                torch.save({
+                    'epoch': epoch,
+                    'verifier': verifier.module.state_dict() if is_distributed else verifier.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'script_acc': val_metrics['script_acc'],
+                    'anomaly_acc': val_metrics['anomaly_acc']
+                }, os.path.join(args.output_dir, 'verifier_best.pt'))
+                print(f"  â New best! Saved verifier_best.pt")
+    
+    # Save combined model (only rank 0)
+    if rank == 0:
+        print("\nSaving combined model...")
+        torch.save({
+            'backbone': checkpoint['model'],
+            'verifier': verifier.module.state_dict() if is_distributed else verifier.state_dict(),
+            'num_classes': num_classes,
+            'class_to_idx': class_to_idx,
+            'hidden_dim': args.hidden_dim,
+            'num_layers': args.num_layers
+        }, os.path.join(args.output_dir, 'full_model.pt'))
         
-        if val_metrics['script_acc'] > best_script_acc:
-            best_script_acc = val_metrics['script_acc']
-            torch.save({
-                'epoch': epoch,
-                'verifier': verifier.state_dict(),
-                'script_acc': val_metrics['script_acc'],
-                'anomaly_acc': val_metrics['anomaly_acc']
-            }, os.path.join(args.output_dir, 'verifier_best.pt'))
-            print(f"  ✓ New best! Saved verifier_best.pt")
+        print("\n" + "=" * 60)
+        print("PHASE 2 COMPLETE")
+        print("=" * 60)
+        print(f"Best script accuracy: {best_script_acc:.4f}")
+        print(f"Models saved to: {args.output_dir}/")
+        print(f"\nFor inference, use: {args.output_dir}/full_model.pt")
     
-    # Save combined model
-    print("\nSaving combined model...")
-    torch.save({
-        'backbone': checkpoint['model'],
-        'verifier': verifier.state_dict(),
-        'num_classes': num_classes,
-        'class_to_idx': class_to_idx,
-        'hidden_dim': args.hidden_dim,
-        'num_layers': args.num_layers
-    }, os.path.join(args.output_dir, 'full_model.pt'))
-    
-    print("\n" + "=" * 60)
-    print("PHASE 2 COMPLETE")
-    print("=" * 60)
-    print(f"Best script accuracy: {best_script_acc:.4f}")
-    print(f"Models saved to: {args.output_dir}/")
-    print(f"\nFor inference, use: {args.output_dir}/full_model.pt")
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
