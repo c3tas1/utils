@@ -1,39 +1,57 @@
 #!/usr/bin/env python3
 """
-Phase 2: Verifier Training (Frozen Backbone)
-=============================================
+Phase 2: Verifier Training (Robust + Prescription-Aware)
+========================================================
 
-Trains ONLY the transformer verifier with frozen backbone.
-Precomputes embeddings for maximum speed.
+Key improvements:
+1. PRESCRIPTION-AWARE: Verifier knows expected NDCs for each prescription
+2. ROBUST: Handles NCCL timeouts, socket errors, auto-saves frequently
+3. DDP SUPPORT: Multi-GPU with proper synchronization
 
 Usage:
     # Single GPU
     python train_phase2_verifier.py \
         --data-dir /path/to/data \
-        --backbone output_phase1/backbone_best.pt \
-        --epochs 20
+        --backbone output_phase1/backbone_best.pt
     
-    # Multi-GPU (if needed for large datasets)
+    # Multi-GPU
+    torchrun --nproc_per_node=8 train_phase2_verifier.py \
+        --data-dir /path/to/data \
+        --backbone output_phase1/backbone_best.pt
+    
+    # Resume after crash
     torchrun --nproc_per_node=8 train_phase2_verifier.py \
         --data-dir /path/to/data \
         --backbone output_phase1/backbone_best.pt \
-        --epochs 20
-
-Output:
-    - verifier_best.pt: Best verifier weights
-    - full_model.pt: Combined backbone + verifier for inference
+        --resume output_phase2/verifier_latest.pt \
+        --skip-extraction
 """
 
 import os
 import sys
-import re
 import csv
 import argparse
 import random
 import pickle
+import signal
+import time
+import socket
 from pathlib import Path
 from datetime import timedelta
-from collections import defaultdict
+from collections import defaultdict, Counter
+from contextlib import contextmanager
+
+# ============================================================================
+# NCCL ROBUSTNESS: Set environment variables BEFORE importing torch
+# ============================================================================
+os.environ.setdefault('NCCL_TIMEOUT', '1800')  # 30 min timeout
+os.environ.setdefault('NCCL_IB_TIMEOUT', '24')  # InfiniBand timeout
+os.environ.setdefault('NCCL_SOCKET_IFNAME', 'eth0,en0,eno1,enp')  # Network interface
+os.environ.setdefault('NCCL_DEBUG', 'WARN')  # Show warnings
+os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')  # Async error handling
+os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT', '1')  # Blocking wait
+os.environ.setdefault('NCCL_P2P_DISABLE', '0')  # Enable P2P (try '1' if issues)
+os.environ.setdefault('NCCL_SHM_DISABLE', '0')  # Enable shared memory
 
 import numpy as np
 from PIL import Image, ImageFile
@@ -49,6 +67,106 @@ from torchvision import transforms, models
 from tqdm import tqdm
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+def init_distributed_robust():
+    """Initialize distributed training with multiple fallback strategies."""
+    
+    if 'RANK' not in os.environ:
+        return False, 0, 0, 1, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
+    
+    # Strategy 1: Try NCCL with long timeout
+    backends_to_try = [
+        ('nccl', timedelta(minutes=60)),
+        ('nccl', timedelta(minutes=30)),
+        ('gloo', timedelta(minutes=30)),
+    ]
+    
+    for backend, timeout in backends_to_try:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            
+            if rank == 0:
+                print(f"  Trying {backend} backend with {timeout} timeout...")
+            
+            dist.init_process_group(
+                backend=backend,
+                timeout=timeout,
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+            
+            # Test communication
+            test_tensor = torch.ones(1, device=device)
+            dist.all_reduce(test_tensor)
+            
+            if rank == 0:
+                print(f"  â Successfully initialized with {backend}")
+            
+            return True, rank, local_rank, world_size, device
+            
+        except Exception as e:
+            if rank == 0:
+                print(f"  â {backend} failed: {e}")
+            continue
+    
+    # All strategies failed - fall back to single GPU
+    if rank == 0:
+        print("  â  All distributed backends failed. Running single GPU.")
+    
+    return False, 0, 0, 1, device
+
+
+# =============================================================================
+# Robustness Utilities
+# =============================================================================
+
+class GracefulKiller:
+    """Handle SIGTERM/SIGINT gracefully."""
+    kill_now = False
+    
+    def __init__(self):
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
+    
+    def exit_gracefully(self, *args):
+        print("\nâ ï¸  Received shutdown signal. Saving checkpoint...")
+        self.kill_now = True
+
+
+def safe_all_reduce(tensor, op=dist.ReduceOp.SUM, max_retries=3):
+    """All-reduce with retry on failure."""
+    for attempt in range(max_retries):
+        try:
+            dist.all_reduce(tensor, op=op)
+            return True
+        except Exception as e:
+            print(f"  Warning: all_reduce failed (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    return False
+
+
+def safe_barrier(max_retries=3):
+    """Barrier with retry on failure."""
+    if not dist.is_initialized():
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            dist.barrier()
+            return True
+        except Exception as e:
+            print(f"  Warning: barrier failed (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    return False
 
 
 # =============================================================================
@@ -88,26 +206,55 @@ class PillClassifier(nn.Module):
 
 
 # =============================================================================
-# Verifier
+# Prescription-Aware Verifier
 # =============================================================================
 
-class PrescriptionVerifier(nn.Module):
-    """Transformer-based verifier."""
+class PrescriptionAwareVerifier(nn.Module):
+    """
+    Verifier that uses BOTH:
+    1. Pill embeddings (what the model sees)
+    2. Expected prescription composition (what SHOULD be there)
     
-    def __init__(self, embed_dim: int = 512, hidden_dim: int = 256, 
+    This allows the model to compare:
+    - "I see 10 round white pills" vs "Prescription says 10x Aspirin"
+    """
+    
+    def __init__(self, num_classes: int, embed_dim: int = 512, hidden_dim: int = 256, 
                  num_heads: int = 8, num_layers: int = 4, dropout: float = 0.1):
         super().__init__()
         
-        # Project: embedding (512) + confidence (1) + logits_entropy (1) = 514
-        self.projector = nn.Sequential(
-            nn.Linear(embed_dim + 2, hidden_dim),
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        
+        # NDC embedding (learnable embedding for each drug class)
+        self.ndc_embedding = nn.Embedding(num_classes, hidden_dim)
+        
+        # Pill feature projection: embedding + confidence + entropy + predicted_class_embed
+        # 512 (embedding) + 1 (conf) + 1 (entropy) + hidden_dim (predicted NDC embed)
+        self.pill_projector = nn.Sequential(
+            nn.Linear(embed_dim + 2 + hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Transformer
+        # Prescription composition encoder
+        # Encodes "expected" pill counts per NDC
+        self.rx_encoder = nn.Sequential(
+            nn.Linear(num_classes, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Cross-attention: pills attend to prescription expectation
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Transformer encoder for pill sequence
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
@@ -120,66 +267,102 @@ class PrescriptionVerifier(nn.Module):
             num_layers=num_layers
         )
         
-        # Summary token
+        # Summary token for prescription-level prediction
         self.summary_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         
         # Output heads
-        self.script_head = nn.Linear(hidden_dim, 1)
+        self.script_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # Concat summary + rx_encoding
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
         self.anomaly_head = nn.Linear(hidden_dim, 1)
     
-    def forward(self, embeddings, confidences, entropies, mask):
+    def forward(self, pill_embeddings, pill_logits, expected_composition, mask):
         """
         Args:
-            embeddings: (B, N, 512)
-            confidences: (B, N, 1) - max softmax prob
-            entropies: (B, N, 1) - entropy of predictions
-            mask: (B, N) - True for padding
+            pill_embeddings: (B, N, 512) - backbone embeddings
+            pill_logits: (B, N, num_classes) - classification logits
+            expected_composition: (B, num_classes) - count of each NDC in prescription
+            mask: (B, N) - True for padding positions
         """
-        B, N, _ = embeddings.shape
+        B, N, _ = pill_embeddings.shape
+        device = pill_embeddings.device
         
-        # Combine features
-        x = torch.cat([embeddings, confidences, entropies], dim=-1)
-        x = self.projector(x)
+        # Compute pill features
+        probs = F.softmax(pill_logits, dim=-1)
+        confidences = probs.max(dim=-1).values.unsqueeze(-1)  # (B, N, 1)
+        entropies = -(probs * (probs + 1e-8).log()).sum(dim=-1).unsqueeze(-1)
+        entropies = entropies / np.log(self.num_classes)  # Normalize
+        
+        # Get predicted class embeddings
+        predicted_classes = pill_logits.argmax(dim=-1)  # (B, N)
+        predicted_ndc_embeds = self.ndc_embedding(predicted_classes)  # (B, N, hidden_dim)
+        
+        # Combine pill features
+        pill_features = torch.cat([
+            pill_embeddings, confidences, entropies, predicted_ndc_embeds
+        ], dim=-1)
+        pill_tokens = self.pill_projector(pill_features)  # (B, N, hidden_dim)
+        
+        # Encode expected prescription composition
+        rx_encoding = self.rx_encoder(expected_composition)  # (B, hidden_dim)
+        rx_tokens = rx_encoding.unsqueeze(1)  # (B, 1, hidden_dim)
+        
+        # Cross-attention: pills attend to prescription expectation
+        # "Does what I see match what's expected?"
+        pill_tokens_attended, _ = self.cross_attention(
+            pill_tokens, rx_tokens, rx_tokens,
+            key_padding_mask=None  # rx_tokens has no padding
+        )
+        pill_tokens = pill_tokens + pill_tokens_attended  # Residual
         
         # Add summary token
         summary = self.summary_token.expand(B, -1, -1)
-        x = torch.cat([summary, x], dim=1)
+        tokens = torch.cat([summary, pill_tokens], dim=1)  # (B, 1+N, hidden)
         
-        # Extend mask
-        summary_mask = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
+        # Extend mask for summary token
+        summary_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
         full_mask = torch.cat([summary_mask, mask], dim=1)
         
-        # Encode
-        x = self.encoder(x, src_key_padding_mask=full_mask)
+        # Transformer encoding
+        encoded = self.encoder(tokens, src_key_padding_mask=full_mask)
         
-        # Outputs
-        script_logit = self.script_head(x[:, 0, :])
-        anomaly_logits = self.anomaly_head(x[:, 1:, :]).squeeze(-1)
+        # Extract outputs
+        summary_out = encoded[:, 0, :]  # (B, hidden)
+        pill_out = encoded[:, 1:, :]  # (B, N, hidden)
+        
+        # Script prediction: combine summary with rx_encoding
+        script_features = torch.cat([summary_out, rx_encoding], dim=-1)
+        script_logit = self.script_head(script_features)  # (B, 1)
+        
+        # Anomaly prediction per pill
+        anomaly_logits = self.anomaly_head(pill_out).squeeze(-1)  # (B, N)
         
         return script_logit, anomaly_logits
 
 
 # =============================================================================
-# Precomputed Embeddings Dataset
+# Dataset with Prescription Composition
 # =============================================================================
 
 class PrecomputedPrescriptionDataset(Dataset):
     """
-    Dataset using precomputed embeddings.
-    Much faster than running backbone every iteration!
+    Dataset with precomputed embeddings AND expected composition.
     """
     
     def __init__(self, embeddings_file: str, prescriptions: list, 
-                 error_rate: float = 0.5, is_training: bool = True):
+                 num_classes: int, error_rate: float = 0.5, is_training: bool = True):
         
         # Load precomputed embeddings
         print(f"Loading embeddings from {embeddings_file}...")
         with open(embeddings_file, 'rb') as f:
             data = pickle.load(f)
         
-        self.embeddings = data['embeddings']  # {relative_path: embedding}
-        self.logits = data['logits']  # {relative_path: logits}
+        self.embeddings = data['embeddings']
+        self.logits = data['logits']
         self.class_to_idx = data['class_to_idx']
+        self.num_classes = num_classes
         
         self.prescriptions = prescriptions
         self.error_rate = error_rate
@@ -196,6 +379,8 @@ class PrecomputedPrescriptionDataset(Dataset):
         else:
             self.pill_library = {}
             self.ndc_list = []
+        
+        print(f"  Loaded {len(prescriptions)} prescriptions")
     
     def __len__(self):
         return len(self.prescriptions)
@@ -204,15 +389,23 @@ class PrecomputedPrescriptionDataset(Dataset):
         rx = self.prescriptions[idx]
         pills = rx['pills']
         
-        # Error injection
+        # Compute EXPECTED composition (before any error injection)
+        expected_composition = torch.zeros(self.num_classes)
+        for pill in pills:
+            ndc_idx = self.class_to_idx[pill['ndc']]
+            expected_composition[ndc_idx] += 1
+        # Normalize by total pills
+        expected_composition = expected_composition / len(pills)
+        
+        # Prepare pill data
         is_correct = True
         pill_correct = [1.0] * len(pills)
         pill_paths = [p['path'] for p in pills]
         pill_labels = [self.class_to_idx[p['ndc']] for p in pills]
         
+        # Error injection (training only)
         if self.is_training and random.random() < self.error_rate:
             is_correct = False
-            # Inject 1-3 errors
             num_errors = random.randint(1, min(3, len(pills)))
             error_indices = random.sample(range(len(pills)), num_errors)
             
@@ -234,25 +427,17 @@ class PrecomputedPrescriptionDataset(Dataset):
                 embeddings.append(self.embeddings[path])
                 logits_list.append(self.logits[path])
             else:
-                # Fallback (shouldn't happen)
                 embeddings.append(torch.zeros(512))
-                logits_list.append(torch.zeros(len(self.class_to_idx)))
+                logits_list.append(torch.zeros(self.num_classes))
         
         embeddings = torch.stack(embeddings)
         logits = torch.stack(logits_list)
         
-        # Compute confidence and entropy
-        probs = F.softmax(logits, dim=-1)
-        confidences = probs.max(dim=-1).values
-        entropies = -(probs * (probs + 1e-8).log()).sum(dim=-1)
-        entropies = entropies / np.log(len(self.class_to_idx))  # Normalize
-        
         return {
             'embeddings': embeddings,
             'logits': logits,
-            'confidences': confidences,
-            'entropies': entropies,
             'labels': torch.tensor(pill_labels, dtype=torch.long),
+            'expected_composition': expected_composition,
             'is_correct': torch.tensor(float(is_correct)),
             'pill_correct': torch.tensor(pill_correct),
             'num_pills': len(pills)
@@ -268,33 +453,30 @@ def collate_fn(batch):
     
     embeddings = torch.zeros(B, max_pills, embed_dim)
     logits = torch.zeros(B, max_pills, num_classes)
-    confidences = torch.zeros(B, max_pills)
-    entropies = torch.zeros(B, max_pills)
     labels = torch.full((B, max_pills), -100, dtype=torch.long)
     mask = torch.ones(B, max_pills, dtype=torch.bool)
     pill_correct = torch.zeros(B, max_pills)
     is_correct = torch.zeros(B)
+    expected_composition = torch.zeros(B, num_classes)
     
     for i, b in enumerate(batch):
         n = b['num_pills']
         embeddings[i, :n] = b['embeddings']
         logits[i, :n] = b['logits']
-        confidences[i, :n] = b['confidences']
-        entropies[i, :n] = b['entropies']
         labels[i, :n] = b['labels']
         mask[i, :n] = False
         pill_correct[i, :n] = b['pill_correct']
         is_correct[i] = b['is_correct']
+        expected_composition[i] = b['expected_composition']
     
     return {
         'embeddings': embeddings,
         'logits': logits,
-        'confidences': confidences.unsqueeze(-1),
-        'entropies': entropies.unsqueeze(-1),
         'labels': labels,
         'mask': mask,
         'pill_correct': pill_correct,
-        'is_correct': is_correct
+        'is_correct': is_correct,
+        'expected_composition': expected_composition
     }
 
 
@@ -317,19 +499,18 @@ def extract_embeddings(backbone, data_dir, index_file, output_file,
         for row in reader:
             samples.append(row['relative_path'])
     
-    samples = list(set(samples))  # Unique paths
+    samples = list(set(samples))
     print(f"  Total unique images: {len(samples)}")
     
-    # Transform
     transform = transforms.Compose([
         transforms.Resize((input_size, input_size)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    # Extract in batches
     embeddings = {}
     logits = {}
+    failed = []
     
     for i in tqdm(range(0, len(samples), batch_size), desc="Extracting"):
         batch_paths = samples[i:i+batch_size]
@@ -342,6 +523,7 @@ def extract_embeddings(backbone, data_dir, index_file, output_file,
                 batch_images.append(transform(img))
                 valid_paths.append(path)
             except Exception as e:
+                failed.append(path)
                 continue
         
         if not batch_images:
@@ -359,8 +541,10 @@ def extract_embeddings(backbone, data_dir, index_file, output_file,
             embeddings[path] = emb[j]
             logits[path] = log[j]
     
-    # Get class_to_idx from backbone checkpoint
-    class_to_idx = {}
+    if failed:
+        print(f"  Warning: Failed to load {len(failed)} images")
+    
+    # Get class_to_idx
     all_ndcs = set()
     with open(index_file, 'r') as f:
         reader = csv.DictReader(f)
@@ -368,7 +552,6 @@ def extract_embeddings(backbone, data_dir, index_file, output_file,
             all_ndcs.add(row['ndc'])
     class_to_idx = {ndc: idx for idx, ndc in enumerate(sorted(all_ndcs))}
     
-    # Save
     print(f"  Saving to {output_file}...")
     with open(output_file, 'wb') as f:
         pickle.dump({
@@ -409,10 +592,11 @@ def load_prescriptions(index_file: str, split: str, min_pills: int = 5, max_pill
 
 
 # =============================================================================
-# Training
+# Training with Robustness
 # =============================================================================
 
-def train_epoch(verifier, loader, optimizer, scaler, device, epoch, rank):
+def train_epoch_robust(verifier, loader, optimizer, scaler, device, epoch, rank, killer, args, is_distributed, start_batch=0):
+    """Training with batch-level checkpointing for crash recovery."""
     verifier.train()
     
     total_loss = 0
@@ -422,43 +606,73 @@ def train_epoch(verifier, loader, optimizer, scaler, device, epoch, rank):
     total_anomaly_count = 0
     
     if rank == 0:
-        pbar = tqdm(loader, desc=f'Epoch {epoch}')
+        pbar = tqdm(loader, desc=f'Epoch {epoch}', initial=start_batch, total=len(loader))
     else:
         pbar = loader
     
-    for batch in pbar:
-        embeddings = batch['embeddings'].to(device)
-        confidences = batch['confidences'].to(device)
-        entropies = batch['entropies'].to(device)
-        mask = batch['mask'].to(device)
-        is_correct = batch['is_correct'].to(device)
-        pill_correct = batch['pill_correct'].to(device)
+    for batch_idx, batch in enumerate(pbar):
+        # Skip batches if resuming mid-epoch
+        if batch_idx < start_batch:
+            continue
+        
+        # Check for shutdown signal
+        if killer.kill_now:
+            if rank == 0:
+                save_checkpoint(verifier, optimizer, epoch, batch_idx,
+                              {'script_acc': 0}, args, is_distributed)
+            return None
+        
+        embeddings = batch['embeddings'].to(device, non_blocking=True)
+        logits = batch['logits'].to(device, non_blocking=True)
+        mask = batch['mask'].to(device, non_blocking=True)
+        is_correct = batch['is_correct'].to(device, non_blocking=True)
+        pill_correct = batch['pill_correct'].to(device, non_blocking=True)
+        expected_composition = batch['expected_composition'].to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        with autocast():
-            script_logit, anomaly_logits = verifier(embeddings, confidences, entropies, mask)
-            
-            # Script loss
-            script_loss = F.binary_cross_entropy_with_logits(
-                script_logit.squeeze(-1), is_correct
-            )
-            
-            # Anomaly loss
-            valid = ~mask
-            if valid.any():
-                anomaly_target = 1.0 - pill_correct
-                anomaly_loss = F.binary_cross_entropy_with_logits(
-                    anomaly_logits[valid], anomaly_target[valid]
+        try:
+            with autocast():
+                script_logit, anomaly_logits = verifier(
+                    embeddings, logits, expected_composition, mask
                 )
-            else:
-                anomaly_loss = torch.tensor(0.0, device=device)
+                
+                # Script loss
+                script_loss = F.binary_cross_entropy_with_logits(
+                    script_logit.squeeze(-1), is_correct
+                )
+                
+                # Anomaly loss
+                valid = ~mask
+                if valid.any():
+                    anomaly_target = 1.0 - pill_correct
+                    anomaly_loss = F.binary_cross_entropy_with_logits(
+                        anomaly_logits[valid], anomaly_target[valid]
+                    )
+                else:
+                    anomaly_loss = torch.tensor(0.0, device=device)
+                
+                loss = script_loss + 2.0 * anomaly_loss
             
-            loss = script_loss + 2.0 * anomaly_loss
-        
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(verifier.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+        except RuntimeError as e:
+            if 'NCCL' in str(e) or 'socket' in str(e).lower():
+                # Critical error - save and exit
+                if rank == 0:
+                    print(f"\nâ ï¸  NCCL/Socket error at batch {batch_idx}: {e}")
+                    save_checkpoint(verifier, optimizer, epoch, batch_idx,
+                                  {'script_acc': 0}, args, is_distributed)
+                return None
+            else:
+                # Non-critical error - skip batch
+                print(f"  Warning: Error in batch {batch_idx}: {e}")
+                optimizer.zero_grad()
+                continue
         
         # Metrics
         B = embeddings.size(0)
@@ -477,14 +691,20 @@ def train_epoch(verifier, loader, optimizer, scaler, device, epoch, rank):
         
         if rank == 0:
             pbar.set_postfix({
-                'loss': f'{total_loss/total_script_count:.4f}',
-                'script': f'{total_script_correct/total_script_count:.4f}',
+                'loss': f'{total_loss/max(1,total_script_count):.4f}',
+                'script': f'{total_script_correct/max(1,total_script_count):.4f}',
                 'anomaly': f'{total_anomaly_correct/max(1,total_anomaly_count):.4f}'
             })
+        
+        # Periodic checkpoint (for crash recovery)
+        if rank == 0 and args.save_every > 0 and (batch_idx + 1) % args.save_every == 0:
+            save_checkpoint(verifier, optimizer, epoch, batch_idx + 1,
+                          {'script_acc': total_script_correct/max(1,total_script_count)}, 
+                          args, is_distributed)
     
     return {
-        'loss': total_loss / total_script_count,
-        'script_acc': total_script_correct / total_script_count,
+        'loss': total_loss / max(1, total_script_count),
+        'script_acc': total_script_correct / max(1, total_script_count),
         'anomaly_acc': total_anomaly_correct / max(1, total_anomaly_count)
     }
 
@@ -500,14 +720,16 @@ def validate(verifier, loader, device, rank=0, is_distributed=False):
     
     for batch in loader:
         embeddings = batch['embeddings'].to(device)
-        confidences = batch['confidences'].to(device)
-        entropies = batch['entropies'].to(device)
+        logits = batch['logits'].to(device)
         mask = batch['mask'].to(device)
         is_correct = batch['is_correct'].to(device)
         pill_correct = batch['pill_correct'].to(device)
+        expected_composition = batch['expected_composition'].to(device)
         
         with autocast():
-            script_logit, anomaly_logits = verifier(embeddings, confidences, entropies, mask)
+            script_logit, anomaly_logits = verifier(
+                embeddings, logits, expected_composition, mask
+            )
         
         B = embeddings.size(0)
         valid = ~mask
@@ -522,13 +744,18 @@ def validate(verifier, loader, device, rank=0, is_distributed=False):
             total_anomaly_correct += ((anomaly_pred == anomaly_target) & valid).sum().item()
             total_anomaly_count += valid.sum().item()
     
-    # Sync across GPUs if distributed
-    if is_distributed:
-        stats = torch.tensor([total_script_correct, total_script_count, 
-                            total_anomaly_correct, total_anomaly_count], 
-                           device=device, dtype=torch.float64)
-        dist.all_reduce(stats)
-        total_script_correct, total_script_count, total_anomaly_correct, total_anomaly_count = stats.tolist()
+    # Sync across GPUs
+    if is_distributed and dist.is_initialized():
+        stats = torch.tensor([
+            total_script_correct, total_script_count,
+            total_anomaly_correct, total_anomaly_count
+        ], device=device, dtype=torch.float64)
+        
+        if not safe_all_reduce(stats):
+            print("  Warning: Failed to sync validation stats")
+        else:
+            total_script_correct, total_script_count, \
+            total_anomaly_correct, total_anomaly_count = stats.tolist()
     
     return {
         'script_acc': total_script_correct / max(1, total_script_count),
@@ -536,14 +763,39 @@ def validate(verifier, loader, device, rank=0, is_distributed=False):
     }
 
 
+def save_checkpoint(verifier, optimizer, epoch, batch, metrics, args, is_distributed, is_best=False):
+    """Save checkpoint with all necessary info for resume."""
+    
+    state = {
+        'epoch': epoch,
+        'batch': batch,
+        'verifier': verifier.module.state_dict() if is_distributed else verifier.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'script_acc': metrics.get('script_acc', 0),
+        'anomaly_acc': metrics.get('anomaly_acc', 0),
+        'args': vars(args)
+    }
+    
+    # Always save latest (overwrites)
+    torch.save(state, os.path.join(args.output_dir, 'verifier_latest.pt'))
+    
+    # Save best
+    if is_best:
+        torch.save(state, os.path.join(args.output_dir, 'verifier_best.pt'))
+    
+    # Periodic saves (every 5 epochs)
+    if batch == 0 and (epoch + 1) % 5 == 0:
+        torch.save(state, os.path.join(args.output_dir, f'verifier_epoch_{epoch}.pt'))
+
+
 # =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Phase 2: Verifier Training')
+    parser = argparse.ArgumentParser(description='Phase 2: Verifier Training (Robust)')
     parser.add_argument('--data-dir', type=str, required=True)
-    parser.add_argument('--backbone', type=str, required=True, help='Path to backbone_best.pt')
+    parser.add_argument('--backbone', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default='./output_phase2')
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch-size', type=int, default=32)
@@ -552,41 +804,35 @@ def main():
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--input-size', type=int, default=224)
     parser.add_argument('--error-rate', type=float, default=0.5)
-    parser.add_argument('--skip-extraction', action='store_true', 
-                       help='Skip embedding extraction (use cached)')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--skip-extraction', action='store_true')
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--save-every', type=int, default=100, 
+                       help='Save checkpoint every N batches (for crash recovery)')
     args = parser.parse_args()
     
-    # DDP Setup
-    is_distributed = 'RANK' in os.environ
+    # Graceful shutdown handler
+    killer = GracefulKiller()
     
-    if is_distributed:
-        rank = int(os.environ['RANK'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group('nccl', timeout=timedelta(minutes=30))
-        device = torch.device(f'cuda:{local_rank}')
-    else:
-        rank = 0
-        local_rank = 0
-        world_size = 1
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Robust distributed initialization
+    is_distributed, rank, local_rank, world_size, device = init_distributed_robust()
     
     os.makedirs(args.output_dir, exist_ok=True)
     
     if rank == 0:
         print("=" * 60)
-        print("PHASE 2: VERIFIER TRAINING")
+        print("PHASE 2: PRESCRIPTION-AWARE VERIFIER (ROBUST)")
         print("=" * 60)
         print(f"Device: {device}")
+        print(f"Distributed: {is_distributed}")
         print(f"World size: {world_size}")
         print(f"Batch size: {args.batch_size} Ã {world_size} = {args.batch_size * world_size}")
-        print(f"Backbone: {args.backbone}")
+        print(f"Save every: {args.save_every} batches")
     
     # Load backbone
     if rank == 0:
         print("\nLoading backbone...")
+    
     checkpoint = torch.load(args.backbone, map_location=device)
     num_classes = checkpoint['num_classes']
     class_to_idx = checkpoint['class_to_idx']
@@ -596,10 +842,10 @@ def main():
     backbone.eval()
     
     if rank == 0:
-        print(f"  Loaded! Val accuracy was: {checkpoint.get('val_acc', 'N/A'):.4f}")
         print(f"  Classes: {num_classes}")
+        print(f"  Backbone accuracy: {checkpoint.get('val_acc', 'N/A'):.4f}")
     
-    # Extract embeddings (only on rank 0, others wait)
+    # Extract embeddings (rank 0 only)
     index_file = os.path.join(args.data_dir, 'dataset_index.csv')
     embeddings_file = os.path.join(args.output_dir, 'embeddings_cache.pkl')
     
@@ -609,50 +855,50 @@ def main():
                 backbone, args.data_dir, index_file, embeddings_file,
                 device, batch_size=64, input_size=args.input_size
             )
-        else:
-            print(f"\nUsing cached embeddings: {embeddings_file}")
     
-    # Sync all processes after extraction
-    if is_distributed:
-        dist.barrier()
+    safe_barrier()
     
     # Load prescriptions
     if rank == 0:
         print("\nLoading prescriptions...")
+    
     train_prescriptions = load_prescriptions(index_file, 'train')
     val_prescriptions = load_prescriptions(index_file, 'valid')
     
     if rank == 0:
-        print(f"  Train prescriptions: {len(train_prescriptions)}")
-        print(f"  Val prescriptions: {len(val_prescriptions)}")
+        print(f"  Train: {len(train_prescriptions)}")
+        print(f"  Val: {len(val_prescriptions)}")
     
     # Datasets
     train_dataset = PrecomputedPrescriptionDataset(
-        embeddings_file, train_prescriptions, 
+        embeddings_file, train_prescriptions, num_classes,
         error_rate=args.error_rate, is_training=True
     )
     val_dataset = PrecomputedPrescriptionDataset(
-        embeddings_file, val_prescriptions,
+        embeddings_file, val_prescriptions, num_classes,
         error_rate=args.error_rate, is_training=False
     )
     
-    # Samplers and DataLoaders
+    # DataLoaders
     train_sampler = DistributedSampler(train_dataset) if is_distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
     
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, 
+        train_dataset, batch_size=args.batch_size,
         sampler=train_sampler, shuffle=(train_sampler is None),
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=args.num_workers, 
+        pin_memory=True, drop_last=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, 
+        val_dataset, batch_size=args.batch_size,
         sampler=val_sampler, shuffle=False,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=args.num_workers,
+        pin_memory=True
     )
     
-    # Verifier model
-    verifier = PrescriptionVerifier(
+    # Model
+    verifier = PrescriptionAwareVerifier(
+        num_classes=num_classes,
         embed_dim=512,
         hidden_dim=args.hidden_dim,
         num_heads=8,
@@ -661,25 +907,37 @@ def main():
     ).to(device)
     
     if is_distributed:
-        verifier = DDP(verifier, device_ids=[local_rank])
+        verifier = DDP(verifier, device_ids=[local_rank], find_unused_parameters=False)
     
     if rank == 0:
-        total_params = sum(p.numel() for p in verifier.parameters())
-        print(f"\nVerifier parameters: {total_params:,}")
+        params = sum(p.numel() for p in verifier.parameters())
+        print(f"\nVerifier parameters: {params:,}")
     
     # Optimizer
     optimizer = torch.optim.AdamW(verifier.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
     scaler = GradScaler()
     
-    # Resume from checkpoint
+    # Resume
     start_epoch = 0
+    start_batch = 0
     best_script_acc = 0.0
     
-    if args.resume and os.path.exists(args.resume):
+    # Try to resume from latest checkpoint first
+    resume_path = args.resume
+    if resume_path is None:
+        # Auto-detect latest checkpoint
+        latest_path = os.path.join(args.output_dir, 'verifier_latest.pt')
+        if os.path.exists(latest_path):
+            resume_path = latest_path
+            if rank == 0:
+                print(f"\nAuto-detected checkpoint: {resume_path}")
+    
+    if resume_path and os.path.exists(resume_path):
         if rank == 0:
-            print(f"\nResuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+            print(f"\nResuming from {resume_path}")
+        
+        ckpt = torch.load(resume_path, map_location=device)
         
         if is_distributed:
             verifier.module.load_state_dict(ckpt['verifier'])
@@ -687,46 +945,74 @@ def main():
             verifier.load_state_dict(ckpt['verifier'])
         
         if 'optimizer' in ckpt:
-            optimizer.load_state_dict(ckpt['optimizer'])
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not load optimizer state: {e}")
         
-        start_epoch = ckpt.get('epoch', 0) + 1
+        start_epoch = ckpt.get('epoch', 0)
+        start_batch = ckpt.get('batch', 0)
         best_script_acc = ckpt.get('script_acc', 0.0)
+        
+        # If we completed the epoch, start from next
+        if start_batch == 0 or start_batch >= len(train_loader) - 1:
+            start_epoch += 1
+            start_batch = 0
         
         for _ in range(start_epoch):
             scheduler.step()
         
         if rank == 0:
-            print(f"  Resumed from epoch {start_epoch}, best_script_acc={best_script_acc:.4f}")
+            print(f"  Resumed: epoch {start_epoch}, batch {start_batch}, best={best_script_acc:.4f}")
     
-    # Training
+    # Training loop
     if rank == 0:
         print("\nStarting training...")
     
     for epoch in range(start_epoch, args.epochs):
+        if killer.kill_now:
+            break
+        
         if is_distributed:
             train_sampler.set_epoch(epoch)
         
-        train_metrics = train_epoch(verifier, train_loader, optimizer, scaler, device, epoch, rank)
+        train_metrics = train_epoch_robust(
+            verifier, train_loader, optimizer, scaler, 
+            device, epoch, rank, killer, args,
+            is_distributed, start_batch if epoch == start_epoch else 0
+        )
+        
+        # Reset start_batch after first epoch
+        start_batch = 0
+        
+        # Check for early exit
+        if train_metrics is None:
+            if rank == 0:
+                print("\nSaving checkpoint before exit...")
+                save_checkpoint(verifier, optimizer, epoch, len(train_loader),
+                              {'script_acc': best_script_acc}, args, is_distributed)
+            break
+        
         val_metrics = validate(verifier, val_loader, device, rank, is_distributed)
         scheduler.step()
         
         if rank == 0:
             print(f"\nEpoch {epoch}:")
-            print(f"  Train - Loss: {train_metrics['loss']:.4f}, Script: {train_metrics['script_acc']:.4f}, Anomaly: {train_metrics['anomaly_acc']:.4f}")
-            print(f"  Val   - Script: {val_metrics['script_acc']:.4f}, Anomaly: {val_metrics['anomaly_acc']:.4f}")
+            print(f"  Train - Loss: {train_metrics['loss']:.4f}, "
+                  f"Script: {train_metrics['script_acc']:.4f}, "
+                  f"Anomaly: {train_metrics['anomaly_acc']:.4f}")
+            print(f"  Val   - Script: {val_metrics['script_acc']:.4f}, "
+                  f"Anomaly: {val_metrics['anomaly_acc']:.4f}")
             
-            if val_metrics['script_acc'] > best_script_acc:
+            is_best = val_metrics['script_acc'] > best_script_acc
+            if is_best:
                 best_script_acc = val_metrics['script_acc']
-                torch.save({
-                    'epoch': epoch,
-                    'verifier': verifier.module.state_dict() if is_distributed else verifier.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'script_acc': val_metrics['script_acc'],
-                    'anomaly_acc': val_metrics['anomaly_acc']
-                }, os.path.join(args.output_dir, 'verifier_best.pt'))
-                print(f"  â New best! Saved verifier_best.pt")
+                print(f"  â New best!")
+            
+            save_checkpoint(verifier, optimizer, epoch, 0, val_metrics, args, is_distributed, is_best)
     
-    # Save combined model (only rank 0)
+    # Save final combined model
     if rank == 0:
         print("\nSaving combined model...")
         torch.save({
@@ -742,10 +1028,8 @@ def main():
         print("PHASE 2 COMPLETE")
         print("=" * 60)
         print(f"Best script accuracy: {best_script_acc:.4f}")
-        print(f"Models saved to: {args.output_dir}/")
-        print(f"\nFor inference, use: {args.output_dir}/full_model.pt")
     
-    if is_distributed:
+    if is_distributed and dist.is_initialized():
         dist.destroy_process_group()
 
 
