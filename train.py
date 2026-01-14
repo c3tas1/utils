@@ -20,10 +20,28 @@ def setup_ddp():
 def cleanup_ddp():
     destroy_process_group()
 
+class UnNormalize(object):
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, tensor):
+        """Un-normalizes a tensor image."""
+        for t, m, s in zip(tensor, self.mean, self.std):
+            t.mul_(s).add_(m)
+        return tensor
+
 def save_visual_check(model, dataset, device, epoch, output_dir):
-    """Saves a visual grid of one batch showing attention and predictions"""
+    """
+    Saves a visual grid.
+    FIXED: Uses UnNormalize and Clamp to prevent OverflowError on negative pixels.
+    """
     model.eval()
-    # Create a small temp loader
+    
+    # Define UnNormalizer with same stats as training
+    unorm = UnNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    # Create small temp loader
     loader = DataLoader(dataset, batch_size=4, collate_fn=collate_mil_pad, shuffle=True)
     images, labels, mask, pids = next(iter(loader))
     images, labels, mask = images.to(device), labels.to(device), mask.to(device)
@@ -32,26 +50,33 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         bag_logits, inst_logits, attn = model(images, mask)
         preds = torch.argmax(bag_logits, dim=1)
         
-    # Plotting Logic
     fig, axes = plt.subplots(len(images), 1, figsize=(15, 5*len(images)))
     if len(images) == 1: axes = [axes]
     
     classes = dataset.classes
     
     for i in range(len(images)):
-        # Unpack pills
         num_pills = int(mask[i].sum().item())
-        curr_imgs = images[i][:num_pills].cpu()
+        
+        # Clone to avoid modifying original tensor
+        curr_imgs_tensor = images[i][:num_pills].detach().cpu().clone()
+        
+        display_imgs = []
+        for p_idx in range(curr_imgs_tensor.shape[0]):
+            # Un-normalize
+            img_unorm = unorm(curr_imgs_tensor[p_idx]) 
+            # Clamp to [0,1] to strictly avoid negative numbers or >1
+            img_unorm = torch.clamp(img_unorm, 0, 1)
+            # Convert to Numpy (H, W, C)
+            img_np = img_unorm.permute(1, 2, 0).numpy()
+            display_imgs.append(img_np)
+
         curr_attn = attn[i][:num_pills].cpu().view(-1).numpy()
         pred_lbl = classes[preds[i]]
         true_lbl = classes[labels[i]]
         
-        # Create a grid for this prescription
-        # We concat images horizontally for visualization
-        grid_img = np.concatenate([np.transpose(img.numpy(), (1, 2, 0)) for img in curr_imgs], axis=1)
-        
-        # Normalize for display
-        grid_img = (grid_img - grid_img.min()) / (grid_img.max() - grid_img.min())
+        # Concatenate horizontally
+        grid_img = np.concatenate(display_imgs, axis=1)
         
         axes[i].imshow(grid_img)
         title = f"GT: {true_lbl} | Pred: {pred_lbl} | Attn Weights: {np.round(curr_attn, 2)}"
@@ -59,6 +84,8 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         axes[i].axis('off')
         
     plt.tight_layout()
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     plt.savefig(f"{output_dir}/epoch_{epoch}_visual_check.png")
     plt.close()
 
@@ -66,14 +93,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=16) # Batch size per GPU
+    parser.add_argument("--batch_size", type=int, default=16)
     args = parser.parse_args()
 
     setup_ddp()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
 
-    # --- Transforms (Heavy augmentation for lighting issues) ---
+    # --- Transforms ---
+    # Strong augmentation to handle your lighting/noise issues
     train_tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
@@ -96,11 +124,11 @@ def main():
     train_sampler = DistributedSampler(train_ds)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, num_workers=4, pin_memory=True)
+    # Validation loader only needed on Rank 0 for visuals usually, but good to have everywhere
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, 
                             collate_fn=collate_mil_pad, num_workers=4)
 
     # --- Model Setup ---
-    # Note: 1228 classes as per prompt
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -124,37 +152,30 @@ def main():
             optimizer.zero_grad()
             bag_logits, inst_logits, _ = model(images, mask)
             
-            # --- 1. Bag (Prescription) Loss ---
+            # --- Bag Loss (Main Goal) ---
             loss_bag = criterion(bag_logits, labels)
             
-            # --- 2. Instance (Pill) Loss ---
-            # We expand labels to match pills: (B) -> (B, M)
+            # --- Instance Loss (Auxiliary Goal) ---
             B, M, _ = inst_logits.shape
-            expanded_labels = labels.unsqueeze(1).repeat(1, M) # (B, M)
-            
-            # Flatten for loss calculation
-            # Only calculate loss for real pills (using mask)
+            expanded_labels = labels.unsqueeze(1).repeat(1, M)
             flat_inst_logits = inst_logits.view(B*M, -1)
             flat_labels = expanded_labels.view(-1)
             flat_mask = mask.view(-1)
             
+            # Only calc loss on real pills (mask=1)
             loss_inst = criterion(flat_inst_logits[flat_mask==1], flat_labels[flat_mask==1])
             
-            # Combined Loss (Weighting bag loss higher as it is the primary goal)
             total_loss = loss_bag + (0.5 * loss_inst)
             
             total_loss.backward()
             optimizer.step()
             
-            # --- Metrics Calculation ---
-            # Bag Accuracy
+            # --- Metrics ---
             bag_preds = torch.argmax(bag_logits, dim=1)
             run_bag_corr += (bag_preds == labels).sum().item()
             run_bag_total += labels.size(0)
             
-            # Instance Accuracy
             inst_preds = torch.argmax(flat_inst_logits, dim=1)
-            # Filter by mask for accuracy
             valid_inst_preds = inst_preds[flat_mask==1]
             valid_inst_labels = flat_labels[flat_mask==1]
             run_inst_corr += (valid_inst_preds == valid_inst_labels).sum().item()
@@ -168,11 +189,14 @@ def main():
 
         scheduler.step()
         
-        # --- Validation & Viz (Rank 0 only) ---
+        # --- Save Checkpoints & Visuals (Rank 0 only) ---
         if local_rank == 0:
             print(f"--> Saving Checkpoint and Visuals for Epoch {epoch}")
             torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch}.pth")
-            save_visual_check(model, val_ds, device, epoch, ".")
+            try:
+                save_visual_check(model, val_ds, device, epoch, "./visual_logs")
+            except Exception as e:
+                print(f"Visual check failed: {e}")
 
     cleanup_ddp()
 
