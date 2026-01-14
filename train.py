@@ -24,11 +24,11 @@ def cleanup_ddp():
 
 def safe_tensor_to_img(img_tensor):
     """
-    Bulletproof conversion from Tensor to Numpy Image.
-    1. Un-normalizes on GPU.
-    2. Clamps to [0, 1].
-    3. Scales to [0, 255].
-    4. Casts to uint8 ON GPU to avoid Python overflow errors.
+    Bulletproof conversion:
+    1. Un-normalize on GPU (Float math).
+    2. Clamp to strict [0, 1] range (Float math).
+    3. Scale to 255 (Float math).
+    4. Cast to uint8 (Safe now because range is guaranteed 0-255).
     """
     # ImageNet stats
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img_tensor.device)
@@ -37,19 +37,16 @@ def safe_tensor_to_img(img_tensor):
     # Un-normalize
     img = img_tensor * std + mean
     
-    # Strict Clamp (Forces all values to be valid 0.0 - 1.0)
+    # STRICT CLAMP: This prevents the "out of bounds" error
     img = torch.clamp(img, 0.0, 1.0)
     
-    # Scale to 255 and convert to ByteTensor (uint8)
+    # Scale and cast
     img = (img * 255.0).type(torch.uint8)
     
-    # Move to CPU and format for Matplotlib (H, W, C)
     return img.permute(1, 2, 0).cpu().numpy()
 
 def save_visual_check(model, dataset, device, epoch, output_dir):
     model.eval()
-    
-    # Create small batch
     loader = DataLoader(dataset, batch_size=4, collate_fn=collate_mil_pad, shuffle=True)
     try:
         images, labels, mask, pids = next(iter(loader))
@@ -69,13 +66,10 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
     
     for i in range(len(images)):
         num_pills = int(mask[i].sum().item())
-        
-        # Get raw tensor for pills in this bag
-        curr_imgs_tensor = images[i][:num_pills] # (Num_Pills, C, H, W)
+        curr_imgs_tensor = images[i][:num_pills]
         
         display_imgs = []
         for p_idx in range(curr_imgs_tensor.shape[0]):
-            # Use safe converter
             img_np = safe_tensor_to_img(curr_imgs_tensor[p_idx])
             display_imgs.append(img_np)
             
@@ -83,7 +77,6 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         pred_lbl = classes[preds[i]]
         true_lbl = classes[labels[i]]
         
-        # Concatenate
         grid_img = np.concatenate(display_imgs, axis=1)
         
         axes[i].imshow(grid_img)
@@ -106,13 +99,17 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
 
-    # Heavy Augmentation for Training
+    # --- CRITICAL FIX IN TRANSFORMS ---
+    # 1. Resize (PIL)
+    # 2. ToTensor (Converts to Float32 [0.0, 1.0]) <-- MOVED UP
+    # 3. ColorJitter (Now runs on Floats, avoiding uint8 overflow)
+    # 4. Normalize
     train_tfm = transforms.Compose([
         transforms.Resize((224, 224)),
+        transforms.ToTensor(), 
         transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
-        transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
@@ -129,7 +126,6 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, num_workers=4, pin_memory=True)
     
-    # Model Setup
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -150,7 +146,6 @@ def main():
             optimizer.zero_grad()
             bag_logits, inst_logits, _ = model(images, mask)
             
-            # Loss Calculation
             loss_bag = criterion(bag_logits, labels)
             
             B, M, _ = inst_logits.shape
@@ -165,7 +160,6 @@ def main():
             total_loss.backward()
             optimizer.step()
             
-            # Metrics
             bag_preds = torch.argmax(bag_logits, dim=1)
             run_bag_corr += (bag_preds == labels).sum().item()
             run_bag_total += labels.size(0)
