@@ -13,12 +13,13 @@ from tqdm import tqdm
 import warnings
 
 # Import modules
-import torch._dynamo
 from model_utils import PrescriptionDataset, collate_mil_pad, GatedAttentionMIL
 
+# --- FIX 1: Silence Warnings ---
 warnings.filterwarnings("ignore")
 
-# Enable TF32 for A100 Speed
+# --- FIX 2: Enable TF32 (The "Safe" Speedup) ---
+# This gives ~3x speedup on A100s without breaking code
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -54,6 +55,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=50)
+    # Batch Size 4 + Checkpointing is the sweet spot for A100 memory
     parser.add_argument("--batch_size", type=int, default=4) 
     parser.add_argument("--accum_steps", type=int, default=8) 
     parser.add_argument("--workers", type=int, default=12) 
@@ -70,11 +72,14 @@ def main():
     
     gpu_aug = GPUAugmentation().to(device)
 
+    # Ensure cache_ram=False if you don't have 1TB+ RAM
     train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
     train_sampler = DistributedSampler(train_ds)
     
+    # --- LOADER OPTIMIZATION ---
+    # persistent_workers=True is crucial for speed
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, 
                               num_workers=args.workers, 
@@ -84,13 +89,11 @@ def main():
 
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     
-    # --- SURGICAL COMPILATION (The Fix) ---
-    # Instead of compiling the whole model (which breaks the Float32 head),
-    # we ONLY compile the Feature Extractor (ResNet).
-    # This keeps the heavy math fast, but leaves the delicate Head logic safe.
-    print("Compiling Backbone... (Safe & Fast)")
-    model.features = torch.compile(model.features)
+    # --- REMOVED TORCH.COMPILE ---
+    # It conflicts with Gradient Checkpointing in DDP. 
+    # TF32 enabled above is enough for high speed.
     
+    # We use find_unused_parameters=False because your graph is fully connected.
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -115,6 +118,7 @@ def main():
         for i, (images, labels, mask, _) in enumerate(pbar):
             images, labels, mask = images.to(device, non_blocking=True), labels.to(device, non_blocking=True), mask.to(device, non_blocking=True)
             
+            # Fast GPU Augmentation
             images = gpu_aug(images, training=True)
             
             with torch.cuda.amp.autocast():
@@ -137,6 +141,7 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
+            # Metrics (Every 10 steps)
             if i % 10 == 0:
                 bag_preds = torch.argmax(bag_logits, dim=1)
                 run_bag_corr += (bag_preds == labels).sum().item()
