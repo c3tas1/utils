@@ -1,0 +1,19 @@
+import onnx
+from onnx import version_converter
+from onnx2torch import convert as onnx_to_torch
+import torch
+
+# Load the ONNX model
+onnx_model = onnx.load("model_converted.onnx")
+
+# Downgrade to opset 14 (well-supported by onnx2torch)
+onnx_model_downgraded = version_converter.convert_version(onnx_model, 14)
+
+# Save the downgraded model (optional)
+onnx.save(onnx_model_downgraded, "model_opset14.onnx")
+
+# Convert to PyTorch
+torch_model = onnx_to_torch(onnx_model_downgraded)
+
+# Save
+torch.save(torch_model.state_dict(), "model.pt")
