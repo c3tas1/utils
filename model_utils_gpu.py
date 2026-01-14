@@ -7,24 +7,13 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
-class UnNormalize(object):
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, tensor):
-        tensor = tensor.clone()
-        for t, m, s in zip(tensor, self.mean, self.std):
-            t.mul_(s).add_(m)
-        return tensor
-
 class PrescriptionDataset(Dataset):
     def __init__(self, root_dir, transform=None, cache_ram=False):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = [] 
         self.cache_ram = cache_ram
-        self.cache = {} # Simple RAM Cache
+        self.cache = {} 
         
         self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
@@ -56,7 +45,6 @@ class PrescriptionDataset(Dataset):
         patch_paths, label, pid = self.samples[idx]
         images = []
         
-        # RAM Caching optimization for small datasets on big DGX nodes
         if self.cache_ram and idx in self.cache:
             return self.cache[idx], label, pid
 
@@ -80,24 +68,26 @@ class PrescriptionDataset(Dataset):
 
 def collate_mil_pad(batch):
     batch_images, labels, pids = zip(*batch)
-    # Limit max pills to 64 during training to prevent OOM spikes
-    # If a tray has 200 pills, we randomly sample 64 for training stability
-    MAX_PILLS = 64 
+    
+    # TRAINING SAFETY CAP
+    # For training, we sample 64 pills.
+    # For inference, the code manually handles chunking, so we don't cap here 
+    # if batch_size=1 (which is standard for inference).
+    MAX_PILLS_TRAIN = 64 
     
     padded_batch = []
     mask = [] 
     
     for img_stack in batch_images:
-        # Random Sampling if too big
-        if img_stack.shape[0] > MAX_PILLS:
-            perm = torch.randperm(img_stack.shape[0])[:MAX_PILLS]
+        # Only cap if we are clearly in training mode (batch > 1 usually implies training speed)
+        # OR if the stack is absurdly large (safety net)
+        if img_stack.shape[0] > MAX_PILLS_TRAIN and len(batch) > 1:
+            perm = torch.randperm(img_stack.shape[0])[:MAX_PILLS_TRAIN]
             img_stack = img_stack[perm]
             
         num_pills = img_stack.shape[0]
-        # We handle padding dynamically in the loop below
         padded_batch.append(img_stack)
         
-    # Re-calculate max for this specific batch
     max_pills_batch = max([x.shape[0] for x in padded_batch])
     c, h, w = padded_batch[0].shape[1:]
     
@@ -122,7 +112,6 @@ class GatedAttentionMIL(nn.Module):
     def __init__(self, num_classes):
         super(GatedAttentionMIL, self).__init__()
         base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        # Split ResNet for checkpointing
         self.features = nn.Sequential(*list(base.children())[:-1])
         self.feature_dim = 2048
         
@@ -132,29 +121,55 @@ class GatedAttentionMIL(nn.Module):
         self.bag_classifier = nn.Linear(self.feature_dim, num_classes)
         self.instance_classifier = nn.Linear(self.feature_dim, num_classes)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, chunk_size=0):
+        """
+        Args:
+            x: (B, M, C, H, W)
+            chunk_size: If > 0, splits M pills into chunks to save memory.
+        """
         B, M, C, H, W = x.shape
-        x = x.view(B * M, C, H, W) 
         
-        # --- GRADIENT CHECKPOINTING ---
-        # This saves memory by re-computing activations during backward pass
-        # Allows you to increase batch size significantly
-        if self.training: 
-            features = checkpoint(self.features, x, use_reentrant=False)
+        # --- PATH A: STANDARD TRAINING (Small Bags or Sampling) ---
+        if chunk_size <= 0 or M <= chunk_size:
+            x = x.view(B * M, C, H, W) 
+            if self.training: 
+                features = checkpoint(self.features, x, use_reentrant=False)
+            else:
+                features = self.features(x)
+            features = features.view(B, M, -1)
+
+        # --- PATH B: CHUNKED INFERENCE (Massive Bags > 300) ---
         else:
-            features = self.features(x)
+            # We process pills in chunks of 'chunk_size' (e.g., 50)
+            feature_list = []
+            # Flatten batch for simple chunking
+            flat_x = x.view(B * M, C, H, W)
             
-        features = features.view(B, M, -1)   
-        
+            with torch.no_grad(): # Inference implies no grad usually
+                for i in range(0, B * M, chunk_size):
+                    batch_chunk = flat_x[i : i + chunk_size]
+                    # Extract features for this chunk
+                    feat_chunk = self.features(batch_chunk)
+                    feature_list.append(feat_chunk.cpu()) # Move to CPU to save GPU RAM
+            
+            # Stitch back together
+            features = torch.cat(feature_list, dim=0).to(x.device) # Move back to GPU for Attention
+            features = features.view(B, M, -1)
+
+        # --- MIL HEAD (Fast & Light) ---
+        # The aggregation head is lightweight, so we can process 300+ vectors easily
         with torch.cuda.amp.autocast(enabled=False):
             features = features.float()
             instance_logits = self.instance_classifier(features)
+            
             A_V = self.attention_V(features)
             A_U = self.attention_U(features)
             A = self.attention_weights(A_V * A_U) 
+            
             if mask is not None:
                 mask_expanded = mask.unsqueeze(-1)
                 A = A.masked_fill(mask_expanded == 0, -1e9)
+                
             A = torch.softmax(A, dim=1) 
             bag_embedding = torch.sum(features * A, dim=1) 
             bag_logits = self.bag_classifier(bag_embedding)
