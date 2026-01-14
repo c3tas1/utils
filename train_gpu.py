@@ -12,13 +12,20 @@ import numpy as np
 from tqdm import tqdm
 import warnings
 
+# Import modules
+import torch._dynamo
 from model_utils import PrescriptionDataset, collate_mil_pad, GatedAttentionMIL
 
+# --- FIX 1: Silence Warnings ---
 warnings.filterwarnings("ignore")
 
-# --- SPEED HACK 1: ENABLE TF32 ON A100 ---
+# --- FIX 2: Enable TF32 for A100 Speed ---
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# --- FIX 3: Disable DDP Optimization in Compiler ---
+# This fixes the "higher order op" crash caused by Gradient Checkpointing
+torch._dynamo.config.optimize_ddp = False 
 
 class GPUAugmentation(nn.Module):
     def __init__(self):
@@ -52,17 +59,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=50)
-    # Batch size 4 is usually safe with Gradient Checkpointing on A100
     parser.add_argument("--batch_size", type=int, default=4) 
-    parser.add_argument("--accum_steps", type=int, default=8) # Effective Batch = 4*8*8GPUs = 256
-    parser.add_argument("--workers", type=int, default=12) # Increased workers
+    parser.add_argument("--accum_steps", type=int, default=8) 
+    parser.add_argument("--workers", type=int, default=12) 
     args = parser.parse_args()
 
     setup_ddp()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
 
-    # Lightweight CPU transforms (Resize only)
     cpu_tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(), 
@@ -70,17 +75,12 @@ def main():
     
     gpu_aug = GPUAugmentation().to(device)
 
-    # --- SPEED HACK 2: RAM CACHING ---
-    # If your DGX has >1TB RAM and your dataset fits (check size!), set cache_ram=True
-    # WARNING: Watch your RAM usage. If it crashes, set back to False.
+    # Note: Ensure cache_ram=False in model_utils.py if you are low on RAM
     train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
     train_sampler = DistributedSampler(train_ds)
     
-    # --- SPEED HACK 3: LOADER OPTIMIZATION ---
-    # persistent_workers=True keeps the RAM loaded. 
-    # prefetch_factor=4 ensures the next batch is ready before GPU asks.
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, 
                               num_workers=args.workers, 
@@ -90,11 +90,14 @@ def main():
 
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     
-    # --- SPEED HACK 4: TORCH COMPILE ---
-    # Fuses kernels for massive A100 speedup
-    print("Compiling model... (This takes a minute at start)")
+    # --- Compile Model ---
+    # We compile BEFORE wrapping in DDP
+    # This optimizes the backbone but respects the DDP disable flag we set above
+    print("Compiling model... (This will take 1-2 mins)")
     model = torch.compile(model)
     
+    # --- FIX 4: find_unused_parameters=False ---
+    # This removes the warning spam and speeds up DDP
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -125,7 +128,6 @@ def main():
                 bag_logits, inst_logits, _ = model(images, mask)
                 loss_bag = criterion(bag_logits, labels)
                 
-                # Simplified loss calculation for speed
                 B, M, _ = inst_logits.shape
                 expanded_labels = labels.unsqueeze(1).repeat(1, M)
                 flat_inst_logits = inst_logits.view(B*M, -1)
@@ -142,8 +144,8 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Metrics (Calculated less frequently to save CPU time)
-            if i % 5 == 0:
+            # Check accuracy every 10 steps to save CPU cycles
+            if i % 10 == 0:
                 bag_preds = torch.argmax(bag_logits, dim=1)
                 run_bag_corr += (bag_preds == labels).sum().item()
                 run_bag_total += labels.size(0)
