@@ -16,16 +16,11 @@ import warnings
 import torch._dynamo
 from model_utils import PrescriptionDataset, collate_mil_pad, GatedAttentionMIL
 
-# --- FIX 1: Silence Warnings ---
 warnings.filterwarnings("ignore")
 
-# --- FIX 2: Enable TF32 for A100 Speed ---
+# Enable TF32 for A100 Speed
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
-# --- FIX 3: Disable DDP Optimization in Compiler ---
-# This fixes the "higher order op" crash caused by Gradient Checkpointing
-torch._dynamo.config.optimize_ddp = False 
 
 class GPUAugmentation(nn.Module):
     def __init__(self):
@@ -75,7 +70,6 @@ def main():
     
     gpu_aug = GPUAugmentation().to(device)
 
-    # Note: Ensure cache_ram=False in model_utils.py if you are low on RAM
     train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
@@ -90,14 +84,13 @@ def main():
 
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     
-    # --- Compile Model ---
-    # We compile BEFORE wrapping in DDP
-    # This optimizes the backbone but respects the DDP disable flag we set above
-    print("Compiling model... (This will take 1-2 mins)")
-    model = torch.compile(model)
+    # --- SURGICAL COMPILATION (The Fix) ---
+    # Instead of compiling the whole model (which breaks the Float32 head),
+    # we ONLY compile the Feature Extractor (ResNet).
+    # This keeps the heavy math fast, but leaves the delicate Head logic safe.
+    print("Compiling Backbone... (Safe & Fast)")
+    model.features = torch.compile(model.features)
     
-    # --- FIX 4: find_unused_parameters=False ---
-    # This removes the warning spam and speeds up DDP
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -144,7 +137,6 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Check accuracy every 10 steps to save CPU cycles
             if i % 10 == 0:
                 bag_preds = torch.argmax(bag_logits, dim=1)
                 run_bag_corr += (bag_preds == labels).sum().item()
