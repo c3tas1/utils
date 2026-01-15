@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 
 from model_utils import PrescriptionDataset, collate_mil_pad, GatedAttentionMIL
 
-# --- CONFIGURATION ---
 warnings.filterwarnings("ignore")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -50,7 +49,6 @@ def setup_ddp():
 def cleanup_ddp():
     destroy_process_group()
 
-# --- HELPER FUNCTIONS ---
 def safe_tensor_to_img(img_tensor):
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img_tensor.device)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img_tensor.device)
@@ -87,7 +85,6 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
     for i in range(len(images)):
         num_pills = int(mask[i].sum().item())
         curr_imgs_tensor = images[i][:num_pills] 
-        
         display_imgs = []
         for p_idx in range(curr_imgs_tensor.shape[0]):
             img_t = curr_imgs_tensor[p_idx]
@@ -109,6 +106,47 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
     plt.savefig(f"{output_dir}/epoch_{epoch}_visual_check.png")
     plt.close()
 
+# --- NEW: VALIDATION LOOP ---
+def validate(model, val_loader, device, gpu_aug):
+    model.eval()
+    val_bag_corr = 0
+    val_bag_total = 0
+    val_inst_corr = 0
+    val_inst_total = 0
+    
+    with torch.no_grad():
+        for images, labels, mask, _ in val_loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            
+            # Apply Normalization Only (No Jitter/Flip)
+            images = gpu_aug(images, training=False)
+            
+            with torch.cuda.amp.autocast():
+                bag_logits, inst_logits, _ = model(images, mask)
+                
+            # Bag Metrics
+            bag_preds = torch.argmax(bag_logits, dim=1)
+            val_bag_corr += (bag_preds == labels).sum().item()
+            val_bag_total += labels.size(0)
+            
+            # Instance Metrics
+            B, M, _ = inst_logits.shape
+            flat_inst_logits = inst_logits.view(B*M, -1)
+            expanded_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
+            flat_mask = mask.view(-1)
+            
+            inst_preds = torch.argmax(flat_inst_logits, dim=1)
+            valid_preds = inst_preds[flat_mask==1]
+            valid_labels = expanded_labels[flat_mask==1]
+            
+            if valid_labels.size(0) > 0:
+                val_inst_corr += (valid_preds == valid_labels).sum().item()
+                val_inst_total += valid_labels.size(0)
+                
+    return val_bag_corr/val_bag_total, val_inst_corr/val_inst_total
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
@@ -116,11 +154,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4) 
     parser.add_argument("--accum_steps", type=int, default=8) 
     parser.add_argument("--workers", type=int, default=12) 
-    
-    # --- NEW RESUME ARGUMENTS ---
-    parser.add_argument("--resume", type=str, default=None, help="Path to .pth file to resume from")
-    parser.add_argument("--start_epoch", type=int, default=0, help="Manually override start epoch (useful for old checkpoints)")
-    
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--start_epoch", type=int, default=0)
     args = parser.parse_args()
 
     setup_ddp()
@@ -138,56 +173,42 @@ def main():
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
     train_sampler = DistributedSampler(train_ds)
+    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, 
                               num_workers=args.workers, 
                               pin_memory=True, 
                               prefetch_factor=4, 
                               persistent_workers=True) 
+                              
+    # Validation Loader (No sampler needed if we validate on one GPU or gather results)
+    # For simplicity in DDP, we usually run validation only on Rank 0 or distribute it.
+    # Here we run on all ranks but only Rank 0 prints. 
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collate_mil_pad, 
+                            num_workers=4, shuffle=False)
 
-    # Init Model
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
-
-    # --- RESUME LOGIC (Before DDP Wrapping) ---
+    
     start_epoch = args.start_epoch
-    loaded_optimizer_state = None
-
+    loaded_opt_state = None
+    
     if args.resume and os.path.isfile(args.resume):
-        if local_rank == 0:
-            print(f"--> Loading checkpoint from {args.resume}")
-        
         checkpoint = torch.load(args.resume, map_location=device)
-        
-        # Check if it's a "New Style" (Dict) or "Old Style" (Weights Only) checkpoint
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            # New Style
             model.load_state_dict(checkpoint['model_state_dict'])
-            if 'epoch' in checkpoint:
-                start_epoch = checkpoint['epoch'] + 1
-            if 'optimizer_state_dict' in checkpoint:
-                loaded_optimizer_state = checkpoint['optimizer_state_dict']
-            if local_rank == 0:
-                print(f"--> Resumed from Epoch {start_epoch} (Full State)")
+            if 'epoch' in checkpoint: start_epoch = checkpoint['epoch'] + 1
+            if 'optimizer_state_dict' in checkpoint: loaded_opt_state = checkpoint['optimizer_state_dict']
         else:
-            # Old Style (Your current case)
             model.load_state_dict(checkpoint)
-            if local_rank == 0:
-                print(f"--> Resumed Weights Only (Old Format). Starting from Epoch {start_epoch}")
-    
-    # Wrap DDP
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    if loaded_opt_state: optimizer.load_state_dict(loaded_opt_state)
     
-    # Load Optimizer State if it existed in the checkpoint
-    if loaded_optimizer_state is not None:
-        optimizer.load_state_dict(loaded_optimizer_state)
-
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.cuda.amp.GradScaler()
 
-    # --- TRAINING LOOP ---
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         model.train()
@@ -200,25 +221,21 @@ def main():
         optimizer.zero_grad()
         
         if local_rank == 0:
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
         else:
             pbar = train_loader
             
         for i, (images, labels, mask, _) in enumerate(pbar):
             images, labels, mask = images.to(device, non_blocking=True), labels.to(device, non_blocking=True), mask.to(device, non_blocking=True)
-            
             images = gpu_aug(images, training=True)
             
             with torch.cuda.amp.autocast():
                 bag_logits, inst_logits, _ = model(images, mask)
                 loss_bag = criterion(bag_logits, labels)
-                
                 B, M, _ = inst_logits.shape
-                expanded_labels = labels.unsqueeze(1).repeat(1, M)
                 flat_inst_logits = inst_logits.view(B*M, -1)
-                flat_labels = expanded_labels.view(-1)
+                flat_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
                 flat_mask = mask.view(-1)
-                
                 loss_inst = criterion(flat_inst_logits[flat_mask==1], flat_labels[flat_mask==1])
                 total_loss = (loss_bag + (0.5 * loss_inst)) / args.accum_steps
             
@@ -229,41 +246,45 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Metrics
             if i % 10 == 0:
                 bag_preds = torch.argmax(bag_logits, dim=1)
                 run_bag_corr += (bag_preds == labels).sum().item()
                 run_bag_total += labels.size(0)
                 
                 inst_preds = torch.argmax(flat_inst_logits, dim=1)
-                valid_inst_preds = inst_preds[flat_mask==1]
-                valid_inst_labels = flat_labels[flat_mask==1]
-                
-                if valid_inst_labels.size(0) > 0:
-                    run_inst_corr += (valid_inst_preds == valid_inst_labels).sum().item()
-                    run_inst_total += valid_inst_labels.size(0)
+                valid_preds = inst_preds[flat_mask==1]
+                valid_labels = flat_labels[flat_mask==1]
+                if valid_labels.size(0) > 0:
+                    run_inst_corr += (valid_preds == valid_labels).sum().item()
+                    run_inst_total += valid_labels.size(0)
 
                 if local_rank == 0 and i % 50 == 0:
                      pill_acc = run_inst_corr/run_inst_total if run_inst_total > 0 else 0
                      pbar.set_postfix({
                         "Loss": f"{total_loss.item() * args.accum_steps:.4f}",
-                        "Bag Acc": f"{run_bag_corr/run_bag_total:.2%}",
-                        "Pill Acc": f"{pill_acc:.2%}"
+                        "Train Bag": f"{run_bag_corr/run_bag_total:.2%}",
+                        "Train Pill": f"{pill_acc:.2%}"
                     })
 
         scheduler.step()
         
+        # --- VALIDATION STEP ---
+        # Run validation on every node, but only print on Rank 0
+        # (Technically each node validates its own slice of val data here)
+        val_bag_acc, val_inst_acc = validate(model, val_loader, device, gpu_aug)
+        
         if local_rank == 0:
-            print(f"--> Saving Full Checkpoint for Epoch {epoch}")
+            print(f"\n--> Epoch {epoch} COMPLETE")
+            print(f"    Train Bag Acc: {run_bag_corr/run_bag_total:.2%} | Train Pill Acc: {run_inst_corr/run_inst_total:.2%}")
+            print(f"    VALID Bag Acc: {val_bag_acc:.2%} | VALID Pill Acc: {val_inst_acc:.2%}")
+            print("-" * 60)
             
-            # NEW SAVING FORMAT (Full State)
             checkpoint_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.module.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }
             torch.save(checkpoint_dict, f"checkpoint_epoch_{epoch}.pth")
-            
             save_visual_check(model, val_ds, device, epoch, ".")
 
     cleanup_ddp()
