@@ -38,15 +38,17 @@ class PrescriptionDataset(Dataset):
         
         print(f"[Dataset] Found {len(self.samples)} prescriptions.")
         
-        # --- RAM CACHE LOGIC ---
+        # RAM Cache (Only if explicitly requested)
         if self.cache_ram:
-            print(f"[Dataset] Caching {len(self.samples)} bags to RAM... (This eliminates disk I/O)")
+            print(f"[Dataset] Caching data to RAM...")
             for idx in range(len(self.samples)):
                 paths, _, _ = self.samples[idx]
                 byte_list = []
                 for p in paths:
-                    with open(p, "rb") as f:
-                        byte_list.append(f.read())
+                    try:
+                        with open(p, "rb") as f:
+                            byte_list.append(f.read())
+                    except: continue
                 self.cache[idx] = byte_list
 
     def __len__(self):
@@ -56,7 +58,7 @@ class PrescriptionDataset(Dataset):
         patch_paths, label, pid = self.samples[idx]
         images = []
         
-        # RAM Mode (Fast)
+        # RAM Mode
         if self.cache_ram and idx in self.cache:
             raw_bytes_list = self.cache[idx]
             for b in raw_bytes_list:
@@ -65,13 +67,15 @@ class PrescriptionDataset(Dataset):
                     if self.transform: img = self.transform(img)
                     images.append(img)
                 except: continue
-        # Disk Mode (Fallback)
+        # Disk Mode (Safe with Context Manager)
         else:
             for p in patch_paths:
                 try:
-                    img = Image.open(p).convert('RGB')
-                    if self.transform: img = self.transform(img)
-                    images.append(img)
+                    # 'with' ensures the file handle is closed immediately
+                    with Image.open(p) as img_raw:
+                        img = img_raw.convert('RGB')
+                        if self.transform: img = self.transform(img)
+                        images.append(img)
                 except: continue
         
         if len(images) == 0:
@@ -84,13 +88,14 @@ class PrescriptionDataset(Dataset):
 def collate_mil_pad(batch):
     batch_images, labels, pids = zip(*batch)
     
-    # Cap training pills to prevent OOM
+    # SAFETY CAP: 48 Pills Max during training
+    # This prevents memory spikes when a tray has 300 pills
     MAX_PILLS_TRAIN = 48 
     padded_batch = []
     mask = [] 
     
     for img_stack in batch_images:
-        # Random sample if too big AND we are training (batch>1)
+        # Random sample if too big AND we are training (batch > 1)
         if img_stack.shape[0] > MAX_PILLS_TRAIN and len(batch) > 1:
             perm = torch.randperm(img_stack.shape[0])[:MAX_PILLS_TRAIN]
             img_stack = img_stack[perm]
@@ -124,7 +129,7 @@ class GatedAttentionMIL(nn.Module):
         self.features = nn.Sequential(*list(base.children())[:-1])
         self.feature_dim = 2048
         
-        # --- DROPOUT ADDED FOR ROBUSTNESS ---
+        # DROPOUT: Critical for fixing the 80% validation ceiling
         self.dropout = nn.Dropout(p=0.5) 
         
         self.attention_V = nn.Sequential(nn.Linear(self.feature_dim, 128), nn.Tanh())
@@ -137,11 +142,9 @@ class GatedAttentionMIL(nn.Module):
     def forward(self, x, mask=None, chunk_size=0):
         B, M, C, H, W = x.shape
         
-        # Feature Extraction (Chunked or Standard)
         if chunk_size <= 0 or M <= chunk_size:
             x = x.view(B * M, C, H, W) 
             if self.training: 
-                # Checkpointing is safe here
                 from torch.utils.checkpoint import checkpoint
                 features = checkpoint(self.features, x, use_reentrant=False)
             else:
@@ -161,7 +164,7 @@ class GatedAttentionMIL(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             features = features.float()
             
-            # --- APPLY DROPOUT ---
+            # Apply Dropout
             features_drop = self.dropout(features)
             
             instance_logits = self.instance_classifier(features_drop)
@@ -177,7 +180,7 @@ class GatedAttentionMIL(nn.Module):
             A = torch.softmax(A, dim=1) 
             bag_embedding = torch.sum(features * A, dim=1) 
             
-            # --- APPLY DROPOUT AGAIN ---
+            # Apply Dropout again
             bag_embedding = self.dropout(bag_embedding)
             bag_logits = self.bag_classifier(bag_embedding)
         
