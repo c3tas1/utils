@@ -24,10 +24,14 @@ torch.backends.cudnn.allow_tf32 = True
 class GPUAugmentation(nn.Module):
     def __init__(self):
         super().__init__()
+        # --- FIX: Stronger Augmentation ---
+        # Prevents model from memorizing specific "glare" patterns
         self.transforms = nn.Sequential(
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+            transforms.RandomVerticalFlip(), # Added Vertical Flip
+            transforms.RandomRotation(180),  # Full rotation
+            # Stronger Color Jitter
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         )
         self.val_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -48,14 +52,6 @@ def setup_ddp():
 
 def cleanup_ddp():
     destroy_process_group()
-
-def safe_tensor_to_img(img_tensor):
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img_tensor.device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img_tensor.device)
-    img = img_tensor * std + mean
-    img = torch.clamp(img, 0.0, 1.0)
-    img = (img * 255.0).type(torch.uint8)
-    return img.permute(1, 2, 0).cpu().numpy()
 
 def save_visual_check(model, dataset, device, epoch, output_dir):
     model.eval()
@@ -106,7 +102,6 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
     plt.savefig(f"{output_dir}/epoch_{epoch}_visual_check.png")
     plt.close()
 
-# --- NEW: VALIDATION LOOP ---
 def validate(model, val_loader, device, gpu_aug):
     model.eval()
     val_bag_corr = 0
@@ -119,27 +114,23 @@ def validate(model, val_loader, device, gpu_aug):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
-            
-            # Apply Normalization Only (No Jitter/Flip)
             images = gpu_aug(images, training=False)
             
             with torch.cuda.amp.autocast():
                 bag_logits, inst_logits, _ = model(images, mask)
                 
-            # Bag Metrics
             bag_preds = torch.argmax(bag_logits, dim=1)
             val_bag_corr += (bag_preds == labels).sum().item()
             val_bag_total += labels.size(0)
             
-            # Instance Metrics
             B, M, _ = inst_logits.shape
             flat_inst_logits = inst_logits.view(B*M, -1)
-            expanded_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
             flat_mask = mask.view(-1)
+            flat_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
             
             inst_preds = torch.argmax(flat_inst_logits, dim=1)
             valid_preds = inst_preds[flat_mask==1]
-            valid_labels = expanded_labels[flat_mask==1]
+            valid_labels = flat_labels[flat_mask==1]
             
             if valid_labels.size(0) > 0:
                 val_inst_corr += (valid_preds == valid_labels).sum().item()
@@ -166,24 +157,16 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor(), 
     ])
-    
     gpu_aug = GPUAugmentation().to(device)
 
     train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
     train_sampler = DistributedSampler(train_ds)
-    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
-                              collate_fn=collate_mil_pad, 
-                              num_workers=args.workers, 
-                              pin_memory=True, 
-                              prefetch_factor=4, 
-                              persistent_workers=True) 
+                              collate_fn=collate_mil_pad, num_workers=args.workers, 
+                              pin_memory=True, prefetch_factor=4, persistent_workers=True) 
                               
-    # Validation Loader (No sampler needed if we validate on one GPU or gather results)
-    # For simplicity in DDP, we usually run validation only on Rank 0 or distribute it.
-    # Here we run on all ranks but only Rank 0 prints. 
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collate_mil_pad, 
                             num_workers=4, shuffle=False)
 
@@ -192,18 +175,27 @@ def main():
     start_epoch = args.start_epoch
     loaded_opt_state = None
     
+    # --- RESUME LOGIC ---
     if args.resume and os.path.isfile(args.resume):
+        if local_rank == 0:
+            print(f"--> Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
+        
+        # We can safely load weights even with new Dropout layers
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False) # Strict=False just in case, but usually fine
             if 'epoch' in checkpoint: start_epoch = checkpoint['epoch'] + 1
             if 'optimizer_state_dict' in checkpoint: loaded_opt_state = checkpoint['optimizer_state_dict']
         else:
-            model.load_state_dict(checkpoint)
-
+            model.load_state_dict(checkpoint, strict=False)
+    
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    if loaded_opt_state: optimizer.load_state_dict(loaded_opt_state)
+
+    # --- FIX: Stronger L2 Regularization (weight_decay=1e-3) ---
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    
+    if loaded_opt_state: 
+        optimizer.load_state_dict(loaded_opt_state)
     
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -219,7 +211,6 @@ def main():
         run_inst_total = 0
         
         optimizer.zero_grad()
-        
         if local_rank == 0:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
         else:
@@ -268,9 +259,6 @@ def main():
 
         scheduler.step()
         
-        # --- VALIDATION STEP ---
-        # Run validation on every node, but only print on Rank 0
-        # (Technically each node validates its own slice of val data here)
         val_bag_acc, val_inst_acc = validate(model, val_loader, device, gpu_aug)
         
         if local_rank == 0:
