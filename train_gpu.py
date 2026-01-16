@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, all_reduce
 from torchvision import transforms
 import numpy as np
 from tqdm import tqdm
@@ -21,16 +21,14 @@ warnings.filterwarnings("ignore")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# --- ROBUST AUGMENTATION ---
 class GPUAugmentation(nn.Module):
     def __init__(self):
         super().__init__()
-        # --- FIX: Stronger Augmentation ---
-        # Prevents model from memorizing specific "glare" patterns
         self.transforms = nn.Sequential(
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(), # Added Vertical Flip
-            transforms.RandomRotation(180),  # Full rotation
-            # Stronger Color Jitter
+            transforms.RandomVerticalFlip(), 
+            transforms.RandomRotation(180),  
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         )
@@ -104,10 +102,7 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
 
 def validate(model, val_loader, device, gpu_aug):
     model.eval()
-    val_bag_corr = 0
-    val_bag_total = 0
-    val_inst_corr = 0
-    val_inst_total = 0
+    local_metrics = torch.zeros(4, device=device, dtype=torch.float64) # [bag_corr, bag_tot, inst_corr, inst_tot]
     
     with torch.no_grad():
         for images, labels, mask, _ in val_loader:
@@ -119,24 +114,31 @@ def validate(model, val_loader, device, gpu_aug):
             with torch.cuda.amp.autocast():
                 bag_logits, inst_logits, _ = model(images, mask)
                 
+            # Bag Metrics
             bag_preds = torch.argmax(bag_logits, dim=1)
-            val_bag_corr += (bag_preds == labels).sum().item()
-            val_bag_total += labels.size(0)
+            local_metrics[0] += (bag_preds == labels).sum().item()
+            local_metrics[1] += labels.size(0)
             
+            # Instance Metrics
             B, M, _ = inst_logits.shape
             flat_inst_logits = inst_logits.view(B*M, -1)
-            flat_mask = mask.view(-1)
             flat_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
+            flat_mask = mask.view(-1)
             
             inst_preds = torch.argmax(flat_inst_logits, dim=1)
             valid_preds = inst_preds[flat_mask==1]
             valid_labels = flat_labels[flat_mask==1]
             
             if valid_labels.size(0) > 0:
-                val_inst_corr += (valid_preds == valid_labels).sum().item()
-                val_inst_total += valid_labels.size(0)
-                
-    return val_bag_corr/val_bag_total, val_inst_corr/val_inst_total
+                local_metrics[2] += (valid_preds == valid_labels).sum().item()
+                local_metrics[3] += valid_labels.size(0)
+
+    # Aggregate across all GPUs
+    all_reduce(local_metrics)
+    
+    bag_acc = local_metrics[0].item() / local_metrics[1].item() if local_metrics[1].item() > 0 else 0
+    inst_acc = local_metrics[2].item() / local_metrics[3].item() if local_metrics[3].item() > 0 else 0
+    return bag_acc, inst_acc
 
 def main():
     parser = argparse.ArgumentParser()
@@ -144,9 +146,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4) 
     parser.add_argument("--accum_steps", type=int, default=8) 
-    parser.add_argument("--workers", type=int, default=12) 
+    parser.add_argument("--workers", type=int, default=8) 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=0)
+    # New Flag: Use this if you have ample RAM (e.g. DGX)
+    parser.add_argument("--cache_ram", action="store_true", help="Load entire dataset into RAM")
     args = parser.parse_args()
 
     setup_ddp()
@@ -159,43 +163,42 @@ def main():
     ])
     gpu_aug = GPUAugmentation().to(device)
 
-    train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
-    val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
+    # Load Datasets (Disk or RAM based on flag)
+    train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=args.cache_ram)
+    val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=args.cache_ram)
     
     train_sampler = DistributedSampler(train_ds)
+    # VALIDATION SAMPLER (The Speed Fix)
+    val_sampler = DistributedSampler(val_ds, shuffle=False)
+    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
                               collate_fn=collate_mil_pad, num_workers=args.workers, 
-                              pin_memory=True, prefetch_factor=4, persistent_workers=True) 
+                              pin_memory=True, prefetch_factor=2, persistent_workers=True) 
                               
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collate_mil_pad, 
-                            num_workers=4, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler,
+                            collate_fn=collate_mil_pad, num_workers=4)
 
     model = GatedAttentionMIL(num_classes=len(train_ds.classes)).to(device)
     
     start_epoch = args.start_epoch
-    loaded_opt_state = None
+    loaded_opt = None
     
-    # --- RESUME LOGIC ---
     if args.resume and os.path.isfile(args.resume):
-        if local_rank == 0:
-            print(f"--> Loading checkpoint from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        
-        # We can safely load weights even with new Dropout layers
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False) # Strict=False just in case, but usually fine
-            if 'epoch' in checkpoint: start_epoch = checkpoint['epoch'] + 1
-            if 'optimizer_state_dict' in checkpoint: loaded_opt_state = checkpoint['optimizer_state_dict']
+        if local_rank == 0: print(f"--> Loading checkpoint {args.resume}")
+        chk = torch.load(args.resume, map_location=device)
+        # Handle strict=False for adding Dropout to existing weights
+        if isinstance(chk, dict) and 'model_state_dict' in chk:
+            model.load_state_dict(chk['model_state_dict'], strict=False)
+            if 'epoch' in chk: start_epoch = chk['epoch'] + 1
+            loaded_opt = chk.get('optimizer_state_dict', None)
         else:
-            model.load_state_dict(checkpoint, strict=False)
-    
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+            model.load_state_dict(chk, strict=False)
 
-    # --- FIX: Stronger L2 Regularization (weight_decay=1e-3) ---
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
-    if loaded_opt_state: 
-        optimizer.load_state_dict(loaded_opt_state)
+    # STRONGER REGULARIZATION
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    if loaded_opt: optimizer.load_state_dict(loaded_opt)
     
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -203,12 +206,11 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
+        val_sampler.set_epoch(epoch)
         model.train()
         
-        run_bag_corr = 0
-        run_bag_total = 0
-        run_inst_corr = 0
-        run_inst_total = 0
+        # Local metrics for progress bar
+        run_metrics = torch.zeros(4, device=device)
         
         optimizer.zero_grad()
         if local_rank == 0:
@@ -237,33 +239,35 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
-            if i % 10 == 0:
-                bag_preds = torch.argmax(bag_logits, dim=1)
-                run_bag_corr += (bag_preds == labels).sum().item()
-                run_bag_total += labels.size(0)
-                
-                inst_preds = torch.argmax(flat_inst_logits, dim=1)
-                valid_preds = inst_preds[flat_mask==1]
-                valid_labels = flat_labels[flat_mask==1]
-                if valid_labels.size(0) > 0:
-                    run_inst_corr += (valid_preds == valid_labels).sum().item()
-                    run_inst_total += valid_labels.size(0)
+            # Update metrics every 50 steps
+            if i % 50 == 0:
+                with torch.no_grad():
+                    bag_preds = torch.argmax(bag_logits, dim=1)
+                    inst_preds = torch.argmax(flat_inst_logits, dim=1)
+                    valid_preds = inst_preds[flat_mask==1]
+                    valid_labels = flat_labels[flat_mask==1]
+                    
+                    run_metrics[0] += (bag_preds == labels).sum()
+                    run_metrics[1] += labels.size(0)
+                    if valid_labels.size(0) > 0:
+                        run_metrics[2] += (valid_preds == valid_labels).sum()
+                        run_metrics[3] += valid_labels.size(0)
 
-                if local_rank == 0 and i % 50 == 0:
-                     pill_acc = run_inst_corr/run_inst_total if run_inst_total > 0 else 0
+                if local_rank == 0:
+                     pill_acc = run_metrics[2]/run_metrics[3] if run_metrics[3] > 0 else 0
                      pbar.set_postfix({
                         "Loss": f"{total_loss.item() * args.accum_steps:.4f}",
-                        "Train Bag": f"{run_bag_corr/run_bag_total:.2%}",
+                        "Train Bag": f"{run_metrics[0]/run_metrics[1]:.2%}",
                         "Train Pill": f"{pill_acc:.2%}"
                     })
 
         scheduler.step()
         
+        # Parallel Validation
         val_bag_acc, val_inst_acc = validate(model, val_loader, device, gpu_aug)
         
         if local_rank == 0:
             print(f"\n--> Epoch {epoch} COMPLETE")
-            print(f"    Train Bag Acc: {run_bag_corr/run_bag_total:.2%} | Train Pill Acc: {run_inst_corr/run_inst_total:.2%}")
             print(f"    VALID Bag Acc: {val_bag_acc:.2%} | VALID Pill Acc: {val_inst_acc:.2%}")
             print("-" * 60)
             
