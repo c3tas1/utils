@@ -21,10 +21,10 @@ warnings.filterwarnings("ignore")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# --- ROBUST AUGMENTATION ---
 class GPUAugmentation(nn.Module):
     def __init__(self):
         super().__init__()
+        # STRONG AUGMENTATION: Prevents memorizing lighting conditions
         self.transforms = nn.Sequential(
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(), 
@@ -58,10 +58,8 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         images, labels, mask, pids = next(iter(loader))
     except StopIteration:
         return
-        
     images, labels, mask = images.to(device), labels.to(device), mask.to(device)
     norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).to(device)
-    
     B, M, C, H, W = images.shape
     images_norm = images.view(B*M, C, H, W)
     images_norm = norm(images_norm)
@@ -71,11 +69,12 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         with torch.no_grad():
             bag_logits, inst_logits, attn = model(images_norm, mask)
             preds = torch.argmax(bag_logits, dim=1)
-        
+    
+    # Simple Visualizer
+    classes = dataset.classes
     fig, axes = plt.subplots(len(images), 1, figsize=(15, 5*len(images)))
     if len(images) == 1: axes = [axes]
     
-    classes = dataset.classes
     for i in range(len(images)):
         num_pills = int(mask[i].sum().item())
         curr_imgs_tensor = images[i][:num_pills] 
@@ -90,8 +89,9 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
         pred_lbl = classes[preds[i]]
         true_lbl = classes[labels[i]]
         
-        grid_img = np.concatenate(display_imgs, axis=1)
-        axes[i].imshow(grid_img)
+        if len(display_imgs) > 0:
+            grid_img = np.concatenate(display_imgs, axis=1)
+            axes[i].imshow(grid_img)
         title = f"GT: {true_lbl} | Pred: {pred_lbl} | Attn: {np.round(curr_attn, 2)}"
         axes[i].set_title(title, color='green' if pred_lbl==true_lbl else 'red')
         axes[i].axis('off')
@@ -102,7 +102,7 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
 
 def validate(model, val_loader, device, gpu_aug):
     model.eval()
-    local_metrics = torch.zeros(4, device=device, dtype=torch.float64) # [bag_corr, bag_tot, inst_corr, inst_tot]
+    local_metrics = torch.zeros(4, device=device, dtype=torch.float64) 
     
     with torch.no_grad():
         for images, labels, mask, _ in val_loader:
@@ -114,12 +114,10 @@ def validate(model, val_loader, device, gpu_aug):
             with torch.cuda.amp.autocast():
                 bag_logits, inst_logits, _ = model(images, mask)
                 
-            # Bag Metrics
             bag_preds = torch.argmax(bag_logits, dim=1)
             local_metrics[0] += (bag_preds == labels).sum().item()
             local_metrics[1] += labels.size(0)
             
-            # Instance Metrics
             B, M, _ = inst_logits.shape
             flat_inst_logits = inst_logits.view(B*M, -1)
             flat_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
@@ -133,9 +131,7 @@ def validate(model, val_loader, device, gpu_aug):
                 local_metrics[2] += (valid_preds == valid_labels).sum().item()
                 local_metrics[3] += valid_labels.size(0)
 
-    # Aggregate across all GPUs
     all_reduce(local_metrics)
-    
     bag_acc = local_metrics[0].item() / local_metrics[1].item() if local_metrics[1].item() > 0 else 0
     inst_acc = local_metrics[2].item() / local_metrics[3].item() if local_metrics[3].item() > 0 else 0
     return bag_acc, inst_acc
@@ -146,29 +142,24 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4) 
     parser.add_argument("--accum_steps", type=int, default=8) 
-    parser.add_argument("--workers", type=int, default=8) 
+    # DEFAULT WORKERS LOWERED TO 4 TO SAVE RAM
+    parser.add_argument("--workers", type=int, default=4) 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=0)
-    # New Flag: Use this if you have ample RAM (e.g. DGX)
-    parser.add_argument("--cache_ram", action="store_true", help="Load entire dataset into RAM")
+    parser.add_argument("--cache_ram", action="store_true")
     args = parser.parse_args()
 
     setup_ddp()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
 
-    cpu_tfm = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(), 
-    ])
+    cpu_tfm = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
     gpu_aug = GPUAugmentation().to(device)
 
-    # Load Datasets (Disk or RAM based on flag)
     train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=args.cache_ram)
     val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=args.cache_ram)
     
     train_sampler = DistributedSampler(train_ds)
-    # VALIDATION SAMPLER (The Speed Fix)
     val_sampler = DistributedSampler(val_ds, shuffle=False)
     
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, 
@@ -182,11 +173,9 @@ def main():
     
     start_epoch = args.start_epoch
     loaded_opt = None
-    
     if args.resume and os.path.isfile(args.resume):
         if local_rank == 0: print(f"--> Loading checkpoint {args.resume}")
         chk = torch.load(args.resume, map_location=device)
-        # Handle strict=False for adding Dropout to existing weights
         if isinstance(chk, dict) and 'model_state_dict' in chk:
             model.load_state_dict(chk['model_state_dict'], strict=False)
             if 'epoch' in chk: start_epoch = chk['epoch'] + 1
@@ -195,8 +184,6 @@ def main():
             model.load_state_dict(chk, strict=False)
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-    
-    # STRONGER REGULARIZATION
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
     if loaded_opt: optimizer.load_state_dict(loaded_opt)
     
@@ -209,9 +196,7 @@ def main():
         val_sampler.set_epoch(epoch)
         model.train()
         
-        # Local metrics for progress bar
         run_metrics = torch.zeros(4, device=device)
-        
         optimizer.zero_grad()
         if local_rank == 0:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
@@ -239,14 +224,12 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Update metrics every 50 steps
             if i % 50 == 0:
                 with torch.no_grad():
                     bag_preds = torch.argmax(bag_logits, dim=1)
                     inst_preds = torch.argmax(flat_inst_logits, dim=1)
                     valid_preds = inst_preds[flat_mask==1]
                     valid_labels = flat_labels[flat_mask==1]
-                    
                     run_metrics[0] += (bag_preds == labels).sum()
                     run_metrics[1] += labels.size(0)
                     if valid_labels.size(0) > 0:
@@ -262,15 +245,12 @@ def main():
                     })
 
         scheduler.step()
-        
-        # Parallel Validation
         val_bag_acc, val_inst_acc = validate(model, val_loader, device, gpu_aug)
         
         if local_rank == 0:
             print(f"\n--> Epoch {epoch} COMPLETE")
             print(f"    VALID Bag Acc: {val_bag_acc:.2%} | VALID Pill Acc: {val_inst_acc:.2%}")
             print("-" * 60)
-            
             checkpoint_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.module.state_dict(),
