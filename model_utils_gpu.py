@@ -5,7 +5,7 @@ import torch.nn as nn
 import torchvision.models as models
 from torch.utils.data import Dataset
 from PIL import Image
-from torch.utils.checkpoint import checkpoint
+import io
 
 class PrescriptionDataset(Dataset):
     def __init__(self, root_dir, transform=None, cache_ram=False):
@@ -18,7 +18,7 @@ class PrescriptionDataset(Dataset):
         self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
         
-        print(f"Indexing dataset from {root_dir}...")
+        print(f"[Dataset] Indexing {root_dir}...")
         for cls_name in self.classes:
             cls_folder = os.path.join(root_dir, cls_name)
             class_idx = self.class_to_idx[cls_name]
@@ -35,8 +35,19 @@ class PrescriptionDataset(Dataset):
             
             for pid, paths in grouped_patches.items():
                 self.samples.append((paths, class_idx, pid))
-                
-        print(f"Found {len(self.samples)} prescriptions.")
+        
+        print(f"[Dataset] Found {len(self.samples)} prescriptions.")
+        
+        # --- RAM CACHE LOGIC ---
+        if self.cache_ram:
+            print(f"[Dataset] Caching {len(self.samples)} bags to RAM... (This eliminates disk I/O)")
+            for idx in range(len(self.samples)):
+                paths, _, _ = self.samples[idx]
+                byte_list = []
+                for p in paths:
+                    with open(p, "rb") as f:
+                        byte_list.append(f.read())
+                self.cache[idx] = byte_list
 
     def __len__(self):
         return len(self.samples)
@@ -45,37 +56,41 @@ class PrescriptionDataset(Dataset):
         patch_paths, label, pid = self.samples[idx]
         images = []
         
+        # RAM Mode (Fast)
         if self.cache_ram and idx in self.cache:
-            return self.cache[idx], label, pid
-
-        for p in patch_paths:
-            try:
-                img = Image.open(p).convert('RGB')
-                if self.transform:
-                    img = self.transform(img)
-                images.append(img)
-            except: continue
+            raw_bytes_list = self.cache[idx]
+            for b in raw_bytes_list:
+                try:
+                    img = Image.open(io.BytesIO(b)).convert('RGB')
+                    if self.transform: img = self.transform(img)
+                    images.append(img)
+                except: continue
+        # Disk Mode (Fallback)
+        else:
+            for p in patch_paths:
+                try:
+                    img = Image.open(p).convert('RGB')
+                    if self.transform: img = self.transform(img)
+                    images.append(img)
+                except: continue
         
         if len(images) == 0:
             stack = torch.zeros((1, 3, 224, 224))
         else:
             stack = torch.stack(images)
             
-        if self.cache_ram:
-            self.cache[idx] = stack
-            
         return stack, label, pid
 
 def collate_mil_pad(batch):
     batch_images, labels, pids = zip(*batch)
     
-    # Randomly sample max 64 pills during training for stability
-    MAX_PILLS_TRAIN = 64 
+    # Cap training pills to prevent OOM
+    MAX_PILLS_TRAIN = 48 
     padded_batch = []
     mask = [] 
     
     for img_stack in batch_images:
-        # Only cap if we are clearly in training mode (batch > 1)
+        # Random sample if too big AND we are training (batch>1)
         if img_stack.shape[0] > MAX_PILLS_TRAIN and len(batch) > 1:
             perm = torch.randperm(img_stack.shape[0])[:MAX_PILLS_TRAIN]
             img_stack = img_stack[perm]
@@ -94,7 +109,6 @@ def collate_mil_pad(batch):
         pad_size = max_pills_batch - n
         m = torch.cat([torch.ones(n), torch.zeros(pad_size)])
         final_mask.append(m)
-        
         if pad_size > 0:
             padding = torch.zeros((pad_size, c, h, w))
             final_batch.append(torch.cat([stack, padding], dim=0))
@@ -110,8 +124,7 @@ class GatedAttentionMIL(nn.Module):
         self.features = nn.Sequential(*list(base.children())[:-1])
         self.feature_dim = 2048
         
-        # --- FIX: Dropout ---
-        # 50% probability of zeroing elements
+        # --- DROPOUT ADDED FOR ROBUSTNESS ---
         self.dropout = nn.Dropout(p=0.5) 
         
         self.attention_V = nn.Sequential(nn.Linear(self.feature_dim, 128), nn.Tanh())
@@ -124,15 +137,17 @@ class GatedAttentionMIL(nn.Module):
     def forward(self, x, mask=None, chunk_size=0):
         B, M, C, H, W = x.shape
         
+        # Feature Extraction (Chunked or Standard)
         if chunk_size <= 0 or M <= chunk_size:
             x = x.view(B * M, C, H, W) 
             if self.training: 
+                # Checkpointing is safe here
+                from torch.utils.checkpoint import checkpoint
                 features = checkpoint(self.features, x, use_reentrant=False)
             else:
                 features = self.features(x)
             features = features.view(B, M, -1)
         else:
-            # Chunked Inference for massive bags
             feature_list = []
             flat_x = x.view(B * M, C, H, W)
             with torch.no_grad(): 
@@ -146,7 +161,7 @@ class GatedAttentionMIL(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             features = features.float()
             
-            # Apply Dropout to features before ANY classification
+            # --- APPLY DROPOUT ---
             features_drop = self.dropout(features)
             
             instance_logits = self.instance_classifier(features_drop)
@@ -160,10 +175,9 @@ class GatedAttentionMIL(nn.Module):
                 A = A.masked_fill(mask_expanded == 0, -1e9)
             
             A = torch.softmax(A, dim=1) 
-            
             bag_embedding = torch.sum(features * A, dim=1) 
             
-            # Apply Dropout again before final bag classification
+            # --- APPLY DROPOUT AGAIN ---
             bag_embedding = self.dropout(bag_embedding)
             bag_logits = self.bag_classifier(bag_embedding)
         
