@@ -24,12 +24,14 @@ torch.backends.cudnn.allow_tf32 = True
 class GPUAugmentation(nn.Module):
     def __init__(self):
         super().__init__()
-        # STRONG AUGMENTATION: Prevents memorizing lighting conditions
+        # --- REVERTED TO FAST AUGMENTATION ---
+        # We removed RandomRotation and Heavy ColorJitter.
+        # This will restore your 3-hour training speed.
         self.transforms = nn.Sequential(
             transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(), 
-            transforms.RandomRotation(180),  
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.RandomVerticalFlip(), # Simple flips are free on GPU
+            # Light Jitter is okay, but we removed the heavy one
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.0),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         )
         self.val_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -70,7 +72,6 @@ def save_visual_check(model, dataset, device, epoch, output_dir):
             bag_logits, inst_logits, attn = model(images_norm, mask)
             preds = torch.argmax(bag_logits, dim=1)
     
-    # Simple Visualizer
     classes = dataset.classes
     fig, axes = plt.subplots(len(images), 1, figsize=(15, 5*len(images)))
     if len(images) == 1: axes = [axes]
@@ -122,11 +123,9 @@ def validate(model, val_loader, device, gpu_aug):
             flat_inst_logits = inst_logits.view(B*M, -1)
             flat_labels = labels.unsqueeze(1).repeat(1, M).view(-1)
             flat_mask = mask.view(-1)
-            
             inst_preds = torch.argmax(flat_inst_logits, dim=1)
             valid_preds = inst_preds[flat_mask==1]
             valid_labels = flat_labels[flat_mask==1]
-            
             if valid_labels.size(0) > 0:
                 local_metrics[2] += (valid_preds == valid_labels).sum().item()
                 local_metrics[3] += valid_labels.size(0)
@@ -142,11 +141,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4) 
     parser.add_argument("--accum_steps", type=int, default=8) 
-    # DEFAULT WORKERS LOWERED TO 4 TO SAVE RAM
-    parser.add_argument("--workers", type=int, default=4) 
+    # Use 8 workers since you have 1TB RAM (prevents CPU bottlenecks)
+    parser.add_argument("--workers", type=int, default=8) 
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=0)
-    parser.add_argument("--cache_ram", action="store_true")
     args = parser.parse_args()
 
     setup_ddp()
@@ -156,8 +154,9 @@ def main():
     cpu_tfm = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
     gpu_aug = GPUAugmentation().to(device)
 
-    train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=args.cache_ram)
-    val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=args.cache_ram)
+    # Disk Mode (Safe and Standard)
+    train_ds = PrescriptionDataset(os.path.join(args.data_dir, 'train'), transform=cpu_tfm, cache_ram=False)
+    val_ds = PrescriptionDataset(os.path.join(args.data_dir, 'valid'), transform=cpu_tfm, cache_ram=False)
     
     train_sampler = DistributedSampler(train_ds)
     val_sampler = DistributedSampler(val_ds, shuffle=False)
@@ -184,6 +183,7 @@ def main():
             model.load_state_dict(chk, strict=False)
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    # Kept stronger regularization as it is cheap
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
     if loaded_opt: optimizer.load_state_dict(loaded_opt)
     
@@ -193,7 +193,6 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)
         model.train()
         
         run_metrics = torch.zeros(4, device=device)
@@ -245,6 +244,7 @@ def main():
                     })
 
         scheduler.step()
+        
         val_bag_acc, val_inst_acc = validate(model, val_loader, device, gpu_aug)
         
         if local_rank == 0:
