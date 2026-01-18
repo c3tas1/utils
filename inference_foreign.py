@@ -1,7 +1,6 @@
 import os
 import argparse
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -10,54 +9,43 @@ from tqdm import tqdm
 import glob
 from PIL import Image
 
-# Import architecture
+# Import your architecture
 from model_utils import GatedAttentionMIL
 
 # --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Threshold: If model is >85% sure a pill is different from the rest, flag it.
-CONFIDENCE_THRESHOLD = 0.85 
+# If model confidence for a specific pill is > 85% and it disagrees with the bag, flag it.
+FOREIGN_THRESH = 0.85 
 
-# --- 1. DATASET THAT PARSES GT FROM FOLDER NAME ---
-class InferenceDataset(Dataset):
-    def __init__(self, root_dir, class_to_idx, transform=None):
+class SmartInferenceDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
-        self.class_to_idx = class_to_idx
         self.bags = [] 
         
-        print(f"--> Indexing prescriptions in {root_dir}...")
+        print(f"--> Scanning test directory: {root_dir}")
         subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
         
-        skipped = 0
         for folder_name in tqdm(subdirs):
-            # --- PARSING LOGIC ---
-            # User Rule: "Amoxicillin_Rx1" -> split('_')[0] -> "Amoxicillin"
+            # LOGIC: "Amoxicillin_RxID_123" -> split('_')[0] -> "Amoxicillin"
             try:
-                gt_class_str = folder_name.split('_')[0]
+                # 1. Extract Ground Truth from folder name
+                gt_class_name = folder_name.split('_')[0]
                 
-                # Check if this class exists in our training map
-                if gt_class_str not in self.class_to_idx:
-                    # Optional: Print warning if class is unknown
-                    # print(f"Warning: Unknown class '{gt_class_str}' in folder '{folder_name}'. Skipping.")
-                    skipped += 1
-                    continue
-                    
-                gt_label = self.class_to_idx[gt_class_str]
+                # 2. Collect images
                 rx_path = os.path.join(root_dir, folder_name)
                 img_paths = glob.glob(os.path.join(rx_path, "*.jpg"))
                 
                 if len(img_paths) > 0:
                     self.bags.append({
-                        "rx_id": folder_name,
-                        "paths": img_paths,
-                        "label": gt_label,
-                        "gt_str": gt_class_str
+                        "rx_id": folder_name,      # "Amoxicillin_RxID_123"
+                        "gt_class": gt_class_name, # "Amoxicillin"
+                        "paths": img_paths
                     })
             except Exception as e:
-                print(f"Error parsing {folder_name}: {e}")
+                print(f"Skipping {folder_name}: {e}")
                 
-        print(f"--> Indexed {len(self.bags)} valid prescriptions (Skipped {skipped} unknown classes).")
+        print(f"--> Ready to test {len(self.bags)} prescriptions.")
 
     def __len__(self):
         return len(self.bags)
@@ -78,16 +66,15 @@ class InferenceDataset(Dataset):
             except: continue
         
         if len(images) == 0:
-            return torch.zeros((1, 3, 224, 224)), -1, item["rx_id"], []
+            # Handle empty folder edge case
+            return torch.zeros((1, 3, 224, 224)), item["rx_id"], "Unknown", []
             
-        return torch.stack(images), item["label"], item["rx_id"], valid_paths
+        return torch.stack(images), item["rx_id"], item["gt_class"], valid_paths
 
-# --- 2. COLLATE FUNCTION ---
-def collate_inference(batch):
-    # Unpack
-    batch_images, labels, rx_ids, batch_paths = zip(*batch)
+def collate_smart(batch):
+    batch_images, rx_ids, gt_classes, batch_paths = zip(*batch)
     
-    # Pad images
+    # Pad bags to same size for batching
     max_pills = max([x.shape[0] for x in batch_images])
     c, h, w = batch_images[0].shape[1:]
     
@@ -99,130 +86,107 @@ def collate_inference(batch):
         pad_size = max_pills - n
         m = torch.cat([torch.ones(n), torch.zeros(pad_size)])
         masks.append(m)
-        
         if pad_size > 0:
             padding = torch.zeros((pad_size, c, h, w))
             padded_imgs.append(torch.cat([stack, padding], dim=0))
         else:
             padded_imgs.append(stack)
             
-    return torch.stack(padded_imgs), torch.stack(masks), torch.tensor(labels), rx_ids, batch_paths
+    return torch.stack(padded_imgs), torch.stack(masks), rx_ids, gt_classes, batch_paths
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test_dir", type=str, required=True, help="Folder with Rx_ID subfolders")
-    parser.add_argument("--train_dir", type=str, required=True, help="Original Train Dir (to get class mapping)")
+    parser.add_argument("--test_dir", type=str, required=True, help="Folder with 'Class_RxID' subfolders")
+    parser.add_argument("--train_dir", type=str, required=True, help="Original Train Dir (to get class order)")
     parser.add_argument("--checkpoint", type=str, required=True)
     args = parser.parse_args()
 
-    # 1. Load Class Map
-    classes = sorted([d for d in os.listdir(args.train_dir) if os.path.isdir(os.path.join(args.train_dir, d))])
-    class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
-    print(f"--> Loaded {len(classes)} classes.")
+    # 1. Load Training Classes (To map Index -> Name)
+    # The model outputs Index 0, 1, 2... we need to know 0="Amoxicillin"
+    train_classes = sorted([d for d in os.listdir(args.train_dir) if os.path.isdir(os.path.join(args.train_dir, d))])
+    print(f"--> Model knows {len(train_classes)} drug classes: {train_classes}")
 
-    # 2. Setup Data
+    # 2. Setup
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    ds = InferenceDataset(args.test_dir, class_to_idx, transform=tfm)
-    loader = DataLoader(ds, batch_size=8, collate_fn=collate_inference, num_workers=4)
+    ds = SmartInferenceDataset(args.test_dir, transform=tfm)
+    loader = DataLoader(ds, batch_size=8, collate_fn=collate_smart, num_workers=4)
 
     # 3. Load Model
-    model = GatedAttentionMIL(num_classes=len(classes)).to(DEVICE)
+    model = GatedAttentionMIL(num_classes=len(train_classes)).to(DEVICE)
     chk = torch.load(args.checkpoint, map_location=DEVICE)
     state_dict = chk['model_state_dict'] if 'model_state_dict' in chk else chk
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict, strict=False)
     model.eval()
 
-    # Metrics
     correct = 0
     total = 0
-    
     foreign_log = []
-    accuracy_log = []
-
-    print(f"--> Running Inference...")
+    
+    print("--> Starting Analysis...")
 
     with torch.no_grad():
         with torch.cuda.amp.autocast():
-            for images, mask, labels, rx_ids, batch_paths in tqdm(loader):
+            for images, mask, rx_ids, gt_classes, batch_paths in tqdm(loader):
                 images = images.to(DEVICE)
                 mask = mask.to(DEVICE)
-                labels = labels.to(DEVICE) # Now we have Ground Truth labels!
                 
                 # Model Inference
                 bag_logits, inst_logits, _ = model(images, mask)
                 
-                # --- A. BAG ACCURACY ---
+                # Bag Predictions
                 bag_probs = F.softmax(bag_logits, dim=1)
                 bag_conf, bag_preds = torch.max(bag_probs, dim=1)
                 
-                correct += (bag_preds == labels).sum().item()
-                total += labels.size(0)
-                
-                # --- B. FOREIGN PILL DETECTION ---
-                B, M, _ = inst_logits.shape
+                # Instance Predictions (For Foreign Object)
                 inst_probs = F.softmax(inst_logits, dim=2)
                 
+                B = images.shape[0]
                 for b in range(B):
-                    curr_rx = rx_ids[b]
-                    curr_pred = classes[bag_preds[b]]
-                    curr_gt = classes[labels[b]]
-                    curr_files = batch_paths[b]
+                    # A. CHECK BAG ACCURACY
+                    pred_name = train_classes[bag_preds[b]]
+                    ground_truth = gt_classes[b]
                     
-                    # Log Accuracy Data
-                    accuracy_log.append({
-                        "Prescription_ID": curr_rx,
-                        "Ground_Truth": curr_gt,
-                        "Prediction": curr_pred,
-                        "Correct": (curr_pred == curr_gt),
-                        "Confidence": f"{bag_conf[b].item():.4f}"
-                    })
+                    if pred_name == ground_truth:
+                        correct += 1
+                    total += 1
                     
-                    # Check Instances
+                    # B. FIND FOREIGN PILLS
                     num_pills = int(mask[b].sum().item())
                     for p in range(num_pills):
                         p_conf, p_idx = torch.max(inst_probs[b, p], dim=0)
+                        p_pred_name = train_classes[p_idx]
                         
-                        # LOGIC: 
-                        # If Pill Prediction != Bag Prediction
-                        # AND Confidence > 85% (Ignore blurry/ambiguous pills)
-                        if p_idx != bag_preds[b] and p_conf > CONFIDENCE_THRESHOLD:
+                        # --- THE LOGIC YOU ASKED FOR ---
+                        # If Pill says "Ibuprofen" but Bag says "Amoxicillin"
+                        # AND model is >85% confident
+                        if p_pred_name != pred_name and p_conf > FOREIGN_THRESH:
                             
-                            foreign_class = classes[p_idx]
-                            fname = os.path.basename(curr_files[p])
-                            
-                            # Console Alert
-                            # print(f"\n[ALERT] Foreign Object in {curr_rx}")
-                            # print(f"        File: {fname}")
-                            # print(f"        Detected: {foreign_class} ({p_conf:.1%})")
+                            bad_file = os.path.basename(batch_paths[b][p])
                             
                             foreign_log.append({
-                                "Prescription_ID": curr_rx,
-                                "File_Name": fname,
-                                "Detected_Class": foreign_class,
+                                "Prescription": rx_ids[b],
+                                "Foreign_Patch_File": bad_file,  # <--- HERE IS THE FILE NAME
+                                "Detected_As": p_pred_name,
                                 "Confidence": f"{p_conf.item():.4f}",
-                                "Bag_Prediction": curr_pred
+                                "Main_Prescription_Is": pred_name
                             })
 
-    # --- FINAL REPORT ---
+    # Final Report
     acc = correct / total if total > 0 else 0
     print("\n" + "="*40)
     print(f"FINAL ACCURACY: {acc:.2%}")
-    print(f"Foreign Objects Found: {len(foreign_log)}")
+    print(f"Foreign Objects Detected: {len(foreign_log)}")
     print("="*40)
     
-    # Save CSVs
-    pd.DataFrame(accuracy_log).to_csv("final_accuracy_report.csv", index=False)
     if len(foreign_log) > 0:
         pd.DataFrame(foreign_log).to_csv("FOREIGN_OBJECTS_FOUND.csv", index=False)
-        print("--> Saved 'FOREIGN_OBJECTS_FOUND.csv'")
-    
-    print("--> Saved 'final_accuracy_report.csv'")
+        print("--> Detailed foreign object report saved to 'FOREIGN_OBJECTS_FOUND.csv'")
 
 if __name__ == "__main__":
     main()
