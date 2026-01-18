@@ -12,40 +12,53 @@ from PIL import Image
 # Import your architecture
 from model_utils import GatedAttentionMIL
 
-# --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# If model confidence for a specific pill is > 85% and it disagrees with the bag, flag it.
 FOREIGN_THRESH = 0.85 
 
-class SmartInferenceDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
+class FixedInferenceDataset(Dataset):
+    def __init__(self, root_dir, class_list, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.bags = [] 
         
+        # Sort class list by length (descending) to ensure "Vitamin_C" matches before "Vitamin"
+        self.known_classes = sorted(class_list, key=len, reverse=True)
+        
         print(f"--> Scanning test directory: {root_dir}")
         subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
         
-        for folder_name in tqdm(subdirs):
-            # LOGIC: "Amoxicillin_RxID_123" -> split('_')[0] -> "Amoxicillin"
-            try:
-                # 1. Extract Ground Truth from folder name
-                gt_class_name = folder_name.split('_')[0]
+        matched_count = 0
+        for i, folder_name in enumerate(tqdm(subdirs, desc="Indexing Folders")):
+            # --- FIXED PARSING LOGIC ---
+            found_class = None
+            for cls in self.known_classes:
+                # Check if folder starts with known class name
+                if folder_name.startswith(cls):
+                    found_class = cls
+                    break
+            
+            if found_class:
+                # --- VERIFICATION PRINT (First 5 matches only) ---
+                if matched_count < 5:
+                    print(f"   [DEBUG] Mapped Folder: '{folder_name}' --> Class: '{found_class}'")
                 
-                # 2. Collect images
                 rx_path = os.path.join(root_dir, folder_name)
                 img_paths = glob.glob(os.path.join(rx_path, "*.jpg"))
                 
                 if len(img_paths) > 0:
                     self.bags.append({
-                        "rx_id": folder_name,      # "Amoxicillin_RxID_123"
-                        "gt_class": gt_class_name, # "Amoxicillin"
+                        "rx_id": folder_name,
+                        "gt_class": found_class,
                         "paths": img_paths
                     })
-            except Exception as e:
-                print(f"Skipping {folder_name}: {e}")
+                    matched_count += 1
+            else:
+                # Print first few failures too, just in case
+                if i < 5: 
+                    print(f"   [WARNING] Could not map folder '{folder_name}' to any known class!")
+                pass
                 
-        print(f"--> Ready to test {len(self.bags)} prescriptions.")
+        print(f"--> Successfully mapped {matched_count} prescriptions.")
 
     def __len__(self):
         return len(self.bags)
@@ -54,33 +67,25 @@ class SmartInferenceDataset(Dataset):
         item = self.bags[idx]
         images = []
         valid_paths = []
-        
         for p in item["paths"]:
             try:
                 with Image.open(p) as img_raw:
                     img = img_raw.convert('RGB')
-                    if self.transform:
-                        img = self.transform(img)
+                    if self.transform: img = self.transform(img)
                     images.append(img)
                     valid_paths.append(p)
             except: continue
         
         if len(images) == 0:
-            # Handle empty folder edge case
             return torch.zeros((1, 3, 224, 224)), item["rx_id"], "Unknown", []
-            
         return torch.stack(images), item["rx_id"], item["gt_class"], valid_paths
 
 def collate_smart(batch):
     batch_images, rx_ids, gt_classes, batch_paths = zip(*batch)
-    
-    # Pad bags to same size for batching
     max_pills = max([x.shape[0] for x in batch_images])
     c, h, w = batch_images[0].shape[1:]
-    
     padded_imgs = []
     masks = []
-    
     for stack in batch_images:
         n = stack.shape[0]
         pad_size = max_pills - n
@@ -91,29 +96,36 @@ def collate_smart(batch):
             padded_imgs.append(torch.cat([stack, padding], dim=0))
         else:
             padded_imgs.append(stack)
-            
     return torch.stack(padded_imgs), torch.stack(masks), rx_ids, gt_classes, batch_paths
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test_dir", type=str, required=True, help="Folder with 'Class_RxID' subfolders")
-    parser.add_argument("--train_dir", type=str, required=True, help="Original Train Dir (to get class order)")
+    parser.add_argument("--test_dir", type=str, required=True)
+    parser.add_argument("--train_dir", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     args = parser.parse_args()
 
-    # 1. Load Training Classes (To map Index -> Name)
-    # The model outputs Index 0, 1, 2... we need to know 0="Amoxicillin"
+    # 1. Load Classes & PRINT THEM
     train_classes = sorted([d for d in os.listdir(args.train_dir) if os.path.isdir(os.path.join(args.train_dir, d))])
-    print(f"--> Model knows {len(train_classes)} drug classes: {train_classes}")
+    
+    print("\n" + "="*50)
+    print(f"CLASS VERIFICATION ({len(train_classes)} total)")
+    print("="*50)
+    print("First 5 classes detected:")
+    for c in train_classes[:5]: print(f" - {c}")
+    print("...")
+    print("Last 5 classes detected:")
+    for c in train_classes[-5:]: print(f" - {c}")
+    print("="*50 + "\n")
 
-    # 2. Setup
+    # 2. Setup Data
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    ds = SmartInferenceDataset(args.test_dir, transform=tfm)
+    ds = FixedInferenceDataset(args.test_dir, train_classes, transform=tfm)
     loader = DataLoader(ds, batch_size=8, collate_fn=collate_smart, num_workers=4)
 
     # 3. Load Model
@@ -127,7 +139,7 @@ def main():
     correct = 0
     total = 0
     foreign_log = []
-    
+
     print("--> Starting Analysis...")
 
     with torch.no_grad():
@@ -136,19 +148,14 @@ def main():
                 images = images.to(DEVICE)
                 mask = mask.to(DEVICE)
                 
-                # Model Inference
                 bag_logits, inst_logits, _ = model(images, mask)
-                
-                # Bag Predictions
                 bag_probs = F.softmax(bag_logits, dim=1)
                 bag_conf, bag_preds = torch.max(bag_probs, dim=1)
-                
-                # Instance Predictions (For Foreign Object)
                 inst_probs = F.softmax(inst_logits, dim=2)
                 
                 B = images.shape[0]
                 for b in range(B):
-                    # A. CHECK BAG ACCURACY
+                    # Check Bag Accuracy
                     pred_name = train_classes[bag_preds[b]]
                     ground_truth = gt_classes[b]
                     
@@ -156,28 +163,21 @@ def main():
                         correct += 1
                     total += 1
                     
-                    # B. FIND FOREIGN PILLS
+                    # Check Foreign Pills
                     num_pills = int(mask[b].sum().item())
                     for p in range(num_pills):
                         p_conf, p_idx = torch.max(inst_probs[b, p], dim=0)
                         p_pred_name = train_classes[p_idx]
                         
-                        # --- THE LOGIC YOU ASKED FOR ---
-                        # If Pill says "Ibuprofen" but Bag says "Amoxicillin"
-                        # AND model is >85% confident
                         if p_pred_name != pred_name and p_conf > FOREIGN_THRESH:
-                            
-                            bad_file = os.path.basename(batch_paths[b][p])
-                            
                             foreign_log.append({
                                 "Prescription": rx_ids[b],
-                                "Foreign_Patch_File": bad_file,  # <--- HERE IS THE FILE NAME
+                                "Foreign_File": os.path.basename(batch_paths[b][p]),
                                 "Detected_As": p_pred_name,
                                 "Confidence": f"{p_conf.item():.4f}",
-                                "Main_Prescription_Is": pred_name
+                                "Expected": pred_name
                             })
 
-    # Final Report
     acc = correct / total if total > 0 else 0
     print("\n" + "="*40)
     print(f"FINAL ACCURACY: {acc:.2%}")
@@ -186,7 +186,6 @@ def main():
     
     if len(foreign_log) > 0:
         pd.DataFrame(foreign_log).to_csv("FOREIGN_OBJECTS_FOUND.csv", index=False)
-        print("--> Detailed foreign object report saved to 'FOREIGN_OBJECTS_FOUND.csv'")
 
 if __name__ == "__main__":
     main()
