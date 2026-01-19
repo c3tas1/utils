@@ -90,6 +90,9 @@ def collate_mil_pad(batch):
     return torch.stack(final_batch), torch.tensor(labels), torch.stack(final_mask), pids
 
 # --- 2. OPENVINO BACKBONE WRAPPER ---
+
+# In model_utils.py -> OpenVINOResNet34 class
+
 class OpenVINOResNet34(nn.Module):
     def __init__(self, xml_path, bin_path):
         super().__init__()
@@ -98,24 +101,26 @@ class OpenVINOResNet34(nn.Module):
         print(f"[Backbone] Loading OpenVINO IR: {os.path.basename(xml_path)}")
         model = self.ie.read_model(model=xml_path, weights=bin_path)
         
-        # Compile for CPU (Standard for OpenVINO)
+        # --- FIX 1: ENABLE DYNAMIC BATCH SIZE ---
+        # This tells OpenVINO: "Dimension 0 (batch) can be anything (-1)"
+        # Standard ResNet Input: [Batch, 3, Height, Width]
+        model.reshape([-1, 3, 224, 224]) 
+        
+        # Compile for CPU
         self.compiled_model = self.ie.compile_model(model=model, device_name="CPU")
+        
+        # --- FIX 2: HANDLE THE 1228 OUTPUT ---
+        # If your model outputs 1228 (Class Probabilities), we ideally want features.
+        # But to prevent crashing, we just accept whatever output 0 is.
         self.output_layer = self.compiled_model.output(0)
         
-        # Determine Output Size
-        out_shape = self.output_layer.shape
-        # Typically [1, 512, 1, 1] for ResNet34 features or [1, 1000] for logits
-        self.feature_dim = out_shape[1] 
-        print(f"[Backbone] Loaded. Feature Dimension: {self.feature_dim}")
+        out_shape = self.output_layer.partial_shape
+        # Handle dynamic dimension in shape reading
+        self.feature_dim = out_shape[1].get_length() if out_shape[1].is_static else 1228
         
-        if self.feature_dim > 2000 and self.feature_dim != 2048:
-             print("[WARNING] Output dim looks like class logits, not features!")
-             print("          For best results, export model without the final FC layer.")
+        print(f"[Backbone] Loaded. Feature Dimension: {self.feature_dim}")
 
     def forward(self, x):
-        # Input: PyTorch Tensor [B, C, H, W] on CPU or GPU
-        # OpenVINO requires: Numpy [B, C, H, W] on CPU
-        
         if x.device.type == 'cuda':
             x_np = x.cpu().numpy()
         else:
@@ -123,11 +128,8 @@ class OpenVINOResNet34(nn.Module):
             
         # Inference
         results = self.compiled_model([x_np])[self.output_layer]
-        
-        # Convert back to Torch
         features = torch.from_numpy(results)
         
-        # Flatten if [B, 512, 1, 1] -> [B, 512]
         if len(features.shape) == 4:
             features = features.view(features.size(0), -1)
             
