@@ -29,16 +29,27 @@ def cleanup_ddp():
 
 def calculate_accuracy(logits, labels, mask=None):
     """Helper to calculate accuracy for a batch"""
-    preds = torch.argmax(logits, dim=1)
+    # --- FIX START ---
+    # Check if this is Bag Logits (2D) or Instance Logits (3D)
+    if logits.dim() == 3:
+        # Instance Level: [Batch, Pills, Classes] -> argmax on dim 2
+        preds = torch.argmax(logits, dim=2)
+    else:
+        # Bag Level: [Batch, Classes] -> argmax on dim 1
+        preds = torch.argmax(logits, dim=1)
+    # --- FIX END ---
     
     if mask is None:
         # Bag Level
         correct = (preds == labels).sum().item()
         total = labels.size(0)
     else:
-        # Instance Level (Flatten and ignore padding)
+        # Instance Level
         flat_preds = preds.view(-1)
-        flat_labels = labels.unsqueeze(1).repeat(1, logits.shape[1]).view(-1)
+        
+        # Expand labels to match the number of pills
+        num_pills = logits.shape[1]
+        flat_labels = labels.unsqueeze(1).repeat(1, num_pills).view(-1)
         flat_mask = mask.view(-1)
         
         valid_preds = flat_preds[flat_mask == 1]
@@ -62,7 +73,6 @@ def validate(model, val_loader, device, criterion):
         for imgs, labels, mask, _ in val_loader:
             labels = labels.to(device)
             mask = mask.to(device)
-            # imgs stay on CPU for OpenVINO
             
             bag_logits, inst_logits, _ = model(imgs, mask)
             
@@ -79,7 +89,7 @@ def validate(model, val_loader, device, criterion):
             correct_pills += i_corr
             total_pills += i_tot
             
-    avg_loss = val_loss / len(val_loader)
+    avg_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
     bag_acc = correct_bags / total_bags if total_bags > 0 else 0
     pill_acc = correct_pills / total_pills if total_pills > 0 else 0
     
@@ -87,8 +97,8 @@ def validate(model, val_loader, device, criterion):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to TRAIN folder (e.g. ./patches/train)")
-    parser.add_argument("--val_dir", type=str, required=True, help="Path to VALID folder (e.g. ./patches/valid)")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to TRAIN folder")
+    parser.add_argument("--val_dir", type=str, required=True, help="Path to VALID folder")
     parser.add_argument("--xml_path", type=str, required=True, help="Path to .xml model")
     parser.add_argument("--bin_path", type=str, required=True, help="Path to .bin model")
     parser.add_argument("--epochs", type=int, default=30)
@@ -113,8 +123,7 @@ def main():
     train_sampler = DistributedSampler(train_ds)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, collate_fn=collate_mil_pad, num_workers=4)
 
-    # Val Loader (Only on Rank 0 usually, but DDP handles it better if all do it or we gather. 
-    # For simplicity, we run validation on all ranks but report Rank 0)
+    # Val Loader
     val_ds = PrescriptionDataset(args.val_dir, transform=tfm)
     # Ensure val classes match train classes exactly
     val_ds.class_to_idx = train_ds.class_to_idx 
@@ -194,7 +203,7 @@ def main():
             r_pill_corr += i_c
             r_pill_tot += i_t
             
-            if local_rank == 0:
+            if local_rank == 0 and isinstance(pbar, tqdm):
                 curr_bag_acc = r_bag_corr / r_bag_tot if r_bag_tot > 0 else 0
                 curr_pill_acc = r_pill_corr / r_pill_tot if r_pill_tot > 0 else 0
                 pbar.set_postfix({
@@ -204,7 +213,7 @@ def main():
                 })
 
         # --- VALIDATION ---
-        # Note: We run this on all ranks, but only print Rank 0 to avoid clutter
+        # Note: We run this on all ranks, but only print Rank 0
         val_loss, val_bag_acc, val_pill_acc = validate(model, val_loader, device, criterion)
         
         if local_rank == 0:
