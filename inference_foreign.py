@@ -1,47 +1,65 @@
 import os
+import glob
 import argparse
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import pandas as pd
-from tqdm import tqdm
-import glob
+from torchvision import transforms, models
 from PIL import Image
+from tqdm import tqdm
+import pandas as pd
+import torch.nn.functional as F
 
-# Import your architecture
-from model_utils import GatedAttentionMIL
+# --- CONFIG ---
+FOREIGN_THRESH = 0.95  # Confidence threshold to flag a foreign object
+BACKBONE_BATCH_SIZE = 256 # Batch size for feature extraction (adjust based on VRAM)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FOREIGN_THRESH = 0.85 
+class MILHead(nn.Module):
+    def __init__(self, num_classes, input_dim=512):
+        super().__init__()
+        self.attention_V = nn.Sequential(nn.Linear(input_dim, 128), nn.Tanh())
+        self.attention_U = nn.Sequential(nn.Linear(input_dim, 128), nn.Sigmoid())
+        self.attention_weights = nn.Linear(128, 1)
+        self.bag_classifier = nn.Linear(input_dim, num_classes)
+        self.instance_classifier = nn.Linear(input_dim, num_classes)
 
-class FixedInferenceDataset(Dataset):
+    def forward(self, x):
+        # x: [1, Pills, 512] (Batch size 1 for inference usually)
+        A_V = self.attention_V(x)
+        A_U = self.attention_U(x)
+        A = self.attention_weights(A_V * A_U)
+        A = torch.softmax(A, dim=1) 
+        bag_embedding = torch.sum(x * A, dim=1) 
+        return self.bag_classifier(bag_embedding), self.instance_classifier(x), A
+
+class TestPrescriptionDataset(Dataset):
     def __init__(self, root_dir, class_list, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.bags = [] 
         
-        # Sort class list by length (descending) to ensure "Vitamin_C" matches before "Vitamin"
+        # Sort classes by length (Longest first) to ensure correct matching
+        # e.g. Match "Vitamin_C" before matching "Vitamin"
         self.known_classes = sorted(class_list, key=len, reverse=True)
+        self.class_to_idx = {c: i for i, c in enumerate(class_list)}
         
         print(f"--> Scanning test directory: {root_dir}")
         subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
         
         matched_count = 0
-        for i, folder_name in enumerate(tqdm(subdirs, desc="Indexing Folders")):
-            # --- FIXED PARSING LOGIC ---
+        for folder_name in tqdm(subdirs, desc="Indexing"):
             found_class = None
+            
+            # Smart Matching Logic
             for cls in self.known_classes:
-                # Check if folder starts with known class name
                 if folder_name.startswith(cls):
-                    found_class = cls
-                    break
+                    # Verify boundary (ensure next char is _ or end of string)
+                    remaining = folder_name[len(cls):]
+                    if not remaining or remaining.startswith('_') or remaining.startswith(' '):
+                        found_class = cls
+                        break
             
             if found_class:
-                # --- VERIFICATION PRINT (First 5 matches only) ---
-                if matched_count < 5:
-                    print(f"   [DEBUG] Mapped Folder: '{folder_name}' --> Class: '{found_class}'")
-                
                 rx_path = os.path.join(root_dir, folder_name)
                 img_paths = glob.glob(os.path.join(rx_path, "*.jpg"))
                 
@@ -49,143 +67,155 @@ class FixedInferenceDataset(Dataset):
                     self.bags.append({
                         "rx_id": folder_name,
                         "gt_class": found_class,
+                        "gt_idx": self.class_to_idx[found_class],
                         "paths": img_paths
                     })
                     matched_count += 1
-            else:
-                # Print first few failures too, just in case
-                if i < 5: 
-                    print(f"   [WARNING] Could not map folder '{folder_name}' to any known class!")
-                pass
-                
-        print(f"--> Successfully mapped {matched_count} prescriptions.")
+        
+        print(f"--> Indexed {matched_count} prescriptions.")
 
-    def __len__(self):
-        return len(self.bags)
+    def __len__(self): return len(self.bags)
 
     def __getitem__(self, idx):
-        item = self.bags[idx]
-        images = []
-        valid_paths = []
-        for p in item["paths"]:
-            try:
-                with Image.open(p) as img_raw:
-                    img = img_raw.convert('RGB')
-                    if self.transform: img = self.transform(img)
-                    images.append(img)
-                    valid_paths.append(p)
-            except: continue
-        
-        if len(images) == 0:
-            return torch.zeros((1, 3, 224, 224)), item["rx_id"], "Unknown", []
-        return torch.stack(images), item["rx_id"], item["gt_class"], valid_paths
+        # Returns metadata; images are loaded in the main loop to handle variable bag sizes
+        return self.bags[idx]
 
-def collate_smart(batch):
-    batch_images, rx_ids, gt_classes, batch_paths = zip(*batch)
-    max_pills = max([x.shape[0] for x in batch_images])
-    c, h, w = batch_images[0].shape[1:]
-    padded_imgs = []
-    masks = []
-    for stack in batch_images:
-        n = stack.shape[0]
-        pad_size = max_pills - n
-        m = torch.cat([torch.ones(n), torch.zeros(pad_size)])
-        masks.append(m)
-        if pad_size > 0:
-            padding = torch.zeros((pad_size, c, h, w))
-            padded_imgs.append(torch.cat([stack, padding], dim=0))
-        else:
-            padded_imgs.append(stack)
-    return torch.stack(padded_imgs), torch.stack(masks), rx_ids, gt_classes, batch_paths
+def load_backbone(weights_path, device):
+    print(f"--> Loading Backbone: {os.path.basename(weights_path)}")
+    model = models.resnet34(weights=None)
+    
+    # Load weights
+    checkpoint = torch.load(weights_path, map_location='cpu')
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    
+    # Auto-adjust head to load weights, then remove it
+    if 'fc.weight' in new_state_dict:
+        num_classes = new_state_dict['fc.weight'].shape[0]
+        model.fc = nn.Linear(512, num_classes)
+        
+    model.load_state_dict(new_state_dict, strict=False)
+    model.fc = nn.Identity() # Remove head to get features
+    model.to(device)
+    model.eval()
+    return model
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test_dir", type=str, required=True)
-    parser.add_argument("--train_dir", type=str, required=True)
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--test_dir", type=str, required=True, help="Path to test folder containing prescription folders")
+    parser.add_argument("--backbone_path", type=str, required=True, help="Path to resnet34_ddp_restored.pth")
+    parser.add_argument("--mil_path", type=str, required=True, help="Path to mil_final_model.pth")
     args = parser.parse_args()
 
-    # 1. Load Classes & PRINT THEM
-    train_classes = sorted([d for d in os.listdir(args.train_dir) if os.path.isdir(os.path.join(args.train_dir, d))])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print("\n" + "="*50)
-    print(f"CLASS VERIFICATION ({len(train_classes)} total)")
-    print("="*50)
-    print("First 5 classes detected:")
-    for c in train_classes[:5]: print(f" - {c}")
-    print("...")
-    print("Last 5 classes detected:")
-    for c in train_classes[-5:]: print(f" - {c}")
-    print("="*50 + "\n")
+    # 1. Load MIL Head & Class List
+    print(f"--> Loading MIL Head: {os.path.basename(args.mil_path)}")
+    mil_chk = torch.load(args.mil_path, map_location=device)
+    class_list = mil_chk['classes']
+    input_dim = mil_chk.get('input_dim', 512)
+    
+    mil_model = MILHead(num_classes=len(class_list), input_dim=input_dim).to(device)
+    mil_model.load_state_dict(mil_chk['model_state_dict'])
+    mil_model.eval()
+    
+    # 2. Load Backbone
+    backbone = load_backbone(args.backbone_path, device)
 
-    # 2. Setup Data
+    # 3. Setup Data
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    ds = FixedInferenceDataset(args.test_dir, train_classes, transform=tfm)
-    loader = DataLoader(ds, batch_size=8, collate_fn=collate_smart, num_workers=4)
-
-    # 3. Load Model
-    model = GatedAttentionMIL(num_classes=len(train_classes)).to(DEVICE)
-    chk = torch.load(args.checkpoint, map_location=DEVICE)
-    state_dict = chk['model_state_dict'] if 'model_state_dict' in chk else chk
-    new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(new_state_dict, strict=False)
-    model.eval()
-
+    ds = TestPrescriptionDataset(args.test_dir, class_list)
+    
+    # 4. Inference Loop
     correct = 0
     total = 0
-    foreign_log = []
-
-    print("--> Starting Analysis...")
-
-    with torch.no_grad():
-        with torch.cuda.amp.autocast():
-            for images, mask, rx_ids, gt_classes, batch_paths in tqdm(loader):
-                images = images.to(DEVICE)
-                mask = mask.to(DEVICE)
-                
-                bag_logits, inst_logits, _ = model(images, mask)
-                bag_probs = F.softmax(bag_logits, dim=1)
-                bag_conf, bag_preds = torch.max(bag_probs, dim=1)
-                inst_probs = F.softmax(inst_logits, dim=2)
-                
-                B = images.shape[0]
-                for b in range(B):
-                    # Check Bag Accuracy
-                    pred_name = train_classes[bag_preds[b]]
-                    ground_truth = gt_classes[b]
-                    
-                    if pred_name == ground_truth:
-                        correct += 1
-                    total += 1
-                    
-                    # Check Foreign Pills
-                    num_pills = int(mask[b].sum().item())
-                    for p in range(num_pills):
-                        p_conf, p_idx = torch.max(inst_probs[b, p], dim=0)
-                        p_pred_name = train_classes[p_idx]
-                        
-                        if p_pred_name != pred_name and p_conf > FOREIGN_THRESH:
-                            foreign_log.append({
-                                "Prescription": rx_ids[b],
-                                "Foreign_File": os.path.basename(batch_paths[b][p]),
-                                "Detected_As": p_pred_name,
-                                "Confidence": f"{p_conf.item():.4f}",
-                                "Expected": pred_name
-                            })
-
-    acc = correct / total if total > 0 else 0
-    print("\n" + "="*40)
-    print(f"FINAL ACCURACY: {acc:.2%}")
-    print(f"Foreign Objects Detected: {len(foreign_log)}")
-    print("="*40)
+    foreign_objects = []
     
-    if len(foreign_log) > 0:
-        pd.DataFrame(foreign_log).to_csv("FOREIGN_OBJECTS_FOUND.csv", index=False)
+    print("\n--> Starting Inference...")
+    with torch.no_grad():
+        for i in tqdm(range(len(ds))):
+            bag_data = ds[i]
+            img_paths = bag_data['paths']
+            gt_idx = bag_data['gt_idx']
+            rx_id = bag_data['rx_id']
+            
+            # A. Extract Features (Batched to prevent OOM)
+            features_list = []
+            
+            # Create a temporary loader for just this bag's images
+            # (Manual batching is simpler here than a full DataLoader for variable sizes)
+            for chunk_start in range(0, len(img_paths), BACKBONE_BATCH_SIZE):
+                chunk_paths = img_paths[chunk_start : chunk_start + BACKBONE_BATCH_SIZE]
+                images = []
+                valid_chunk_paths = []
+                
+                for p in chunk_paths:
+                    try:
+                        with Image.open(p) as img:
+                            images.append(tfm(img.convert('RGB')))
+                            valid_chunk_paths.append(p)
+                    except: pass
+                
+                if not images: continue
+                
+                img_tensor = torch.stack(images).to(device)
+                
+                # Backbone Inference
+                with torch.cuda.amp.autocast():
+                    feats = backbone(img_tensor)
+                features_list.append(feats)
+            
+            if not features_list:
+                print(f"[Warning] No valid images in {rx_id}")
+                continue
+                
+            # Combine all features for the bag [1, Total_Pills, 512]
+            bag_features = torch.cat(features_list, dim=0).unsqueeze(0) 
+            
+            # B. MIL Inference
+            bag_logits, inst_logits, attention = mil_model(bag_features)
+            
+            # C. Bag Level Metrics
+            pred_idx = torch.argmax(bag_logits, dim=1).item()
+            if pred_idx == gt_idx:
+                correct += 1
+            total += 1
+            
+            # D. Foreign Object Detection
+            # inst_logits shape: [1, Total_Pills, Num_Classes]
+            probs = F.softmax(inst_logits, dim=2).squeeze(0) # [Total_Pills, Num_Classes]
+            
+            # Get max prob and class for each pill
+            p_confs, p_preds = torch.max(probs, dim=1)
+            
+            for p_idx, (conf, pred) in enumerate(zip(p_confs, p_preds)):
+                # Logic: If pill prediction != Bag Prediction AND Confidence is high
+                if pred.item() != pred_idx and conf.item() > FOREIGN_THRESH:
+                    foreign_objects.append({
+                        "Prescription": rx_id,
+                        "File": os.path.basename(img_paths[p_idx]),
+                        "Predicted_Bag": class_list[pred_idx],
+                        "Predicted_Pill": class_list[pred.item()],
+                        "Confidence": f"{conf.item():.4f}"
+                    })
+
+    # 5. Final Report
+    acc = correct / total if total > 0 else 0
+    print("\n" + "="*50)
+    print(f"FINAL TEST ACCURACY: {acc:.2%}")
+    print(f"Total Prescriptions: {total}")
+    print(f"Foreign Objects Detected: {len(foreign_objects)}")
+    print("="*50)
+    
+    if foreign_objects:
+        df = pd.DataFrame(foreign_objects)
+        df.to_csv("test_foreign_objects.csv", index=False)
+        print("--> Foreign object details saved to 'test_foreign_objects.csv'")
 
 if __name__ == "__main__":
     main()
