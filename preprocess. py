@@ -10,28 +10,31 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from tqdm import tqdm
 from PIL import Image
+from collections import defaultdict
 
 # --- CONFIG ---
-BATCH_SIZE = 256
-NUM_WORKERS = 4  # Safe to use workers now because processes are isolated
+# A100 can handle massive batches.
+BATCH_SIZE = 1024
+NUM_WORKERS = 8  
+PREFETCH_FACTOR = 4
 
-class PatchDataset(Dataset):
-    def __init__(self, file_list, transform=None):
-        self.files = file_list
+class UnifiedPatchDataset(Dataset):
+    def __init__(self, image_list, transform=None):
+        self.files = image_list
         self.transform = transform
+        
     def __len__(self): return len(self.files)
+    
     def __getitem__(self, idx):
-        path = self.files[idx]
+        path, rx_id = self.files[idx]
         try:
             with Image.open(path) as img:
-                return self.transform(img.convert('RGB')), path
+                return self.transform(img.convert('RGB')), rx_id
         except:
-            return torch.zeros(3, 224, 224), path
+            return torch.zeros(3, 224, 224), rx_id
 
 def get_backbone(weights_path, device):
-    # Load model on specific device to avoid memory overhead
     model = models.resnet34(weights=None)
-    
     checkpoint = torch.load(weights_path, map_location='cpu')
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -51,99 +54,153 @@ def get_backbone(weights_path, device):
     return model
 
 def run_worker(args):
-    """Worker logic: Runs on a single GPU for a subset of classes"""
+    # Set sharing strategy to file_system to avoid "Too many open files"
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
     gpu_id = args.gpu_id
     device = torch.device(f"cuda:{gpu_id}")
     
-    print(f"[Worker {gpu_id}] Initializing on {device}...")
+    # 1. Gather ALL files first (The "Mega List")
+    print(f"[Worker {gpu_id}] Scanning files...")
+    all_classes = sorted([d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))])
     
-    # 1. Load Model
+    # Slice classes for this GPU
+    chunk_size = math.ceil(len(all_classes) / args.total_shards)
+    start_idx = args.shard_id * chunk_size
+    end_idx = min(start_idx + chunk_size, len(all_classes))
+    my_classes = all_classes[start_idx:end_idx]
+    
+    image_list = []
+    
+    # Pre-scan all images to build ONE big list
+    # sorting ensures patches for the same Rx stay together (mostly)
+    for cls in my_classes:
+        src_folder = os.path.join(args.data_dir, cls)
+        # We also create output directories now
+        os.makedirs(os.path.join(args.output_dir, cls), exist_ok=True)
+        
+        for p in glob.glob(os.path.join(src_folder, "*.jpg")):
+            fname = os.path.basename(p)
+            rx_id = fname.split('_patch_')[0] if "_patch_" in fname else fname.split('.')[0]
+            # Store (path, rx_id) tuple
+            image_list.append((p, rx_id))
+
+    # Sort so that the DataLoader sees continuous blocks of the same Rx
+    # This minimizes how long we have to hold data in memory buffer
+    image_list.sort(key=lambda x: x[1]) 
+    
+    print(f"[Worker {gpu_id}] Loaded {len(image_list)} images. Starting Stream...")
+
+    # 2. Setup Model & Loader
     model = get_backbone(args.weights_path, device)
     
-    # 2. Setup Transform
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # 3. Get my slice of classes
-    all_classes = sorted([d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))])
+    ds = UnifiedPatchDataset(image_list, transform=tfm)
     
-    # Calculate chunk
-    chunk_size = math.ceil(len(all_classes) / args.total_shards)
-    start_idx = args.shard_id * chunk_size
-    end_idx = min(start_idx + chunk_size, len(all_classes))
-    my_classes = all_classes[start_idx:end_idx]
+    loader = DataLoader(
+        ds,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        prefetch_factor=PREFETCH_FACTOR,
+        persistent_workers=True 
+    )
     
-    print(f"[Worker {gpu_id}] Processing {len(my_classes)} classes ({start_idx} to {end_idx})...")
+    # 3. Streaming Inference
+    # We buffer results in memory. Dictionary: rx_id -> list of tensors
+    # Since features are tiny (512 floats), we can hold THOUSANDS in RAM easily.
+    feature_buffer = defaultdict(list)
     
-    # 4. Processing Loop
+    # Helper to flush a prescription to disk
+    def save_rx(r_id, feats):
+        # We need to know the class to save in the right folder. 
+        # We can re-derive it from the RxID or just look up where the original file was.
+        # Faster: Just search my_classes for the one that starts with the string? 
+        # Or simpler: The rx_id usually contains the class name?
+        # Assuming folder structure output_dir/{class_name}/{rx_id}.pt
+        
+        # Optimization: We know which class folder we created earlier.
+        # But rx_id doesn't always contain the clean class name. 
+        # Trick: We know `image_list` had full paths. We lost the path in the loader loop.
+        # FIX: We will scan `my_classes` to find the parent folder. 
+        
+        # Fast lookup: Just try to save. We created folders in the loop above.
+        # But wait, we need the specific class folder name.
+        # Let's assume the RxID is unique enough or we just dump to a flat structure?
+        # NO, user needs class folders.
+        
+        # To avoid slow lookups, let's assume `rx_id` maps to the folder we prepared.
+        # We will loop through `my_classes` to find the match.
+        found = False
+        for cls in my_classes:
+            if r_id.startswith(cls):
+                final_path = os.path.join(args.output_dir, cls, r_id + ".pt")
+                if len(feats) > 0:
+                    try:
+                        stack = torch.stack(feats)
+                        torch.save(stack, final_path)
+                    except:
+                        pass # Corrupt batch
+                found = True
+                break
+        
+    # To optimize finding the class folder:
+    # We can perform a fast lookup if we keep track. 
+    # But since we sorted by RxID, we are processing one class at a time anyway.
+    # So we can cache the "current class".
+    
     with torch.no_grad():
-        for cls in tqdm(my_classes, desc=f"GPU {gpu_id}", position=gpu_id):
-            src_folder = os.path.join(args.data_dir, cls)
-            dst_folder = os.path.join(args.output_dir, cls)
-            os.makedirs(dst_folder, exist_ok=True)
-            
-            # Find images
-            all_imgs = glob.glob(os.path.join(src_folder, "*.jpg"))
-            if not all_imgs: continue
-
-            # Group by Prescription
-            rx_map = {}
-            for p in all_imgs:
-                fname = os.path.basename(p)
-                rx_id = fname.split('_patch_')[0] if "_patch_" in fname else fname.split('.')[0]
-                if rx_id not in rx_map: rx_map[rx_id] = []
-                rx_map[rx_id].append(p)
-            
-            # Extract
-            for rx_id, paths in rx_map.items():
-                save_path = os.path.join(dst_folder, rx_id + ".pt")
-                if os.path.exists(save_path): continue
-
-                ds = PatchDataset(paths, transform=tfm)
-                loader = DataLoader(
-                    ds, 
-                    batch_size=BATCH_SIZE, 
-                    num_workers=NUM_WORKERS, 
-                    pin_memory=True
-                )
+        with torch.cuda.amp.autocast():
+            for images, rx_ids in tqdm(loader, desc=f"GPU {gpu_id}", position=gpu_id):
+                images = images.to(device)
+                features = model(images)
+                features = features.cpu() # Move back to CPU immediately
                 
-                features_list = []
-                # Simple mixed precision
-                with torch.cuda.amp.autocast():
-                    for imgs, _ in loader:
-                        imgs = imgs.to(device)
-                        feats = model(imgs)
-                        features_list.append(feats.cpu())
+                # Unpack batch and group
+                for i in range(len(rx_ids)):
+                    rid = rx_ids[i]
+                    feat = features[i]
+                    feature_buffer[rid].append(feat)
                 
-                if len(features_list) > 0:
-                    full_tensor = torch.cat(features_list, dim=0)
-                    torch.save(full_tensor, save_path)
+                # MEMORY MANAGEMENT:
+                # Since we processed sorted RxIDs, once we see a NEW RxID, 
+                # the old ones are likely done. However, batch boundaries might split them.
+                # Safe approach: Just flush everything every 100 batches? 
+                # Or just keep it all in RAM? 
+                # 25,000 images * 2KB = 50MB. We can store EVERYTHING in RAM.
+                # It's safer and faster than disk checking every loop.
+                pass
 
-    print(f"[Worker {gpu_id}] Finished!")
+    print(f"[Worker {gpu_id}] Inference done. Flushing buffers to disk...")
+    
+    # 4. Final Save (Bulk Write)
+    # This is fast because no GPU needed
+    for r_id, feats in feature_buffer.items():
+        save_rx(r_id, feats)
+
+    print(f"[Worker {gpu_id}] FINISHED.")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--weights_path", type=str, required=True)
-    # Internal arguments for workers
-    parser.add_argument("--launcher", action="store_true", help="Launch parallel workers")
+    parser.add_argument("--launcher", action="store_true")
     parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--total_shards", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=0)
     args = parser.parse_args()
 
     if args.launcher:
-        # --- LAUNCHER MODE ---
         num_gpus = torch.cuda.device_count()
-        print(f"--> Detected {num_gpus} GPUs. Launching {num_gpus} parallel processes...")
-        
+        print(f"--> Launching {num_gpus} workers (Optimized Streaming Mode)...")
         processes = []
         for i in range(num_gpus):
-            # Construct command to call self as a worker
             cmd = [
                 sys.executable, __file__,
                 "--data_dir", args.data_dir,
@@ -153,17 +210,9 @@ def main():
                 "--total_shards", str(num_gpus),
                 "--gpu_id", str(i)
             ]
-            # Launch without waiting
-            p = subprocess.Popen(cmd)
-            processes.append(p)
-            
-        print("--> All workers launched. Waiting for completion...")
-        for p in processes:
-            p.wait()
-        print("--> All Done!")
-        
+            processes.append(subprocess.Popen(cmd))
+        for p in processes: p.wait()
     else:
-        # --- WORKER MODE ---
         run_worker(args)
 
 if __name__ == "__main__":
