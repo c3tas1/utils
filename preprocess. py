@@ -7,11 +7,12 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from tqdm import tqdm
 from PIL import Image
+import multiprocessing
 
 # --- CONFIG ---
-# Batch size per GPU. With 8 A100s, effectively 256 * 8 = 2048 global batch size.
 BATCH_SIZE = 256 
-NUM_WORKERS = 16 
+# Try 4 workers first. If it hangs, set to 0.
+NUM_WORKERS = 4 
 
 class PatchDataset(Dataset):
     def __init__(self, file_list, transform=None):
@@ -24,125 +25,107 @@ class PatchDataset(Dataset):
             with Image.open(path) as img:
                 return self.transform(img.convert('RGB')), path
         except:
-            # Return dummy if image is corrupt
             return torch.zeros(3, 224, 224), path
 
 def get_feature_extractor(weights_path):
     print(f"--> Loading Backbone from {weights_path}...")
-    
-    # 1. Initialize standard ResNet34
     model = models.resnet34(weights=None)
     
-    # 2. Adjust FC to match the saved checkpoint (e.g. 1228 classes)
-    # We must match the architecture EXACTLY to load weights
     checkpoint = torch.load(weights_path, map_location='cpu')
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-    
-    # Clean keys if they have "module." prefix (from DDP training)
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     
-    # Auto-detect number of classes from weights
     if 'fc.weight' in new_state_dict:
         num_classes = new_state_dict['fc.weight'].shape[0]
         model.fc = nn.Linear(512, num_classes)
         
-    # Load weights
     try:
         model.load_state_dict(new_state_dict)
-        print("--> Weights loaded successfully.")
-    except Exception as e:
-        print(f"--> [Warning] Strict load failed. Trying strict=False. Error: {e}")
+    except:
         model.load_state_dict(new_state_dict, strict=False)
 
-    # 3. SURGERY: Remove the Head to output Features (512-dim)
     model.fc = nn.Identity()
-    
     return model
 
 def main():
+    # 1. FORCE SPAWN to prevent hanging
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to input images (e.g. .../train)")
-    parser.add_argument("--output_dir", type=str, required=True, help="Path to save .pt files")
-    parser.add_argument("--weights_path", type=str, required=True, help="Path to resnet34_ddp_restored.pth")
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--weights_path", type=str, required=True)
     args = parser.parse_args()
 
-    # Setup GPU (Multi-GPU support via DataParallel)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count()
     print(f"--> Running on {num_gpus} GPUs!")
 
-    # 1. Setup Model
+    # Setup Model
     model = get_feature_extractor(args.weights_path)
     model.eval()
-    
-    # Wrap in DataParallel to use all 8 GPUs
     if num_gpus > 1:
         model = nn.DataParallel(model)
-        
     model = model.to(device)
 
-    # 2. Setup Transform
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # 3. Scan Classes
     classes = sorted([d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))])
     print(f"--> Found {len(classes)} classes. Starting extraction...")
 
-    # 4. Processing Loop
     with torch.no_grad():
-        for cls in tqdm(classes, desc="Total Progress"):
+        for i, cls in enumerate(tqdm(classes)):
+            # DEBUG PRINT: Verify we are entering the loop
+            if i < 3: print(f"Processing Class: {cls}")
+
             src_folder = os.path.join(args.data_dir, cls)
             dst_folder = os.path.join(args.output_dir, cls)
             os.makedirs(dst_folder, exist_ok=True)
             
-            # Group by Prescription ID
             all_imgs = glob.glob(os.path.join(src_folder, "*.jpg"))
+            if not all_imgs: continue
+
             rx_map = {}
             for p in all_imgs:
-                # Handle filenames like "Amox_Rx1_patch_0.jpg" OR "Amox_Rx1.jpg"
                 fname = os.path.basename(p)
-                if "_patch_" in fname:
-                    rx_id = fname.split('_patch_')[0]
-                else:
-                    rx_id = fname.split('.')[0]
-                    
+                rx_id = fname.split('_patch_')[0] if "_patch_" in fname else fname.split('.')[0]
                 if rx_id not in rx_map: rx_map[rx_id] = []
                 rx_map[rx_id].append(p)
             
-            # Process each prescription
             for rx_id, paths in rx_map.items():
                 save_path = os.path.join(dst_folder, rx_id + ".pt")
                 if os.path.exists(save_path): continue
 
                 ds = PatchDataset(paths, transform=tfm)
                 
-                # IMPORTANT: drop_last=False so we don't lose pills
+                # Use persistent_workers=True only if workers > 0
                 loader = DataLoader(
                     ds, 
-                    batch_size=BATCH_SIZE * num_gpus, # Scale batch size by GPU count
+                    batch_size=BATCH_SIZE * num_gpus,
                     num_workers=NUM_WORKERS, 
                     pin_memory=True,
                     shuffle=False
                 )
                 
                 features_list = []
-                
-                # Mixed Precision for speed
                 with torch.cuda.amp.autocast():
                     for imgs, _ in loader:
                         imgs = imgs.to(device)
-                        feats = model(imgs) # Output: [B, 512]
+                        feats = model(imgs)
                         features_list.append(feats.cpu())
                 
                 if len(features_list) > 0:
-                    full_tensor = torch.cat(features_list, dim=0) # [Num_Pills, 512]
+                    full_tensor = torch.cat(features_list, dim=0)
                     torch.save(full_tensor, save_path)
 
-    print("\n--> Feature Extraction Complete!")
+    print("\n--> Done!")
 
 if __name__ == "__main__":
     main()
