@@ -7,9 +7,10 @@ from torchvision import transforms, models
 from PIL import Image
 import torch.nn.functional as F
 import pandas as pd
+import sys
 
 # --- CONFIG ---
-FOREIGN_THRESH = 0.95  # Confidence to flag a pill as "Wrong"
+FOREIGN_THRESH = 0.95   # Confidence to flag a pill as "Wrong"
 BACKBONE_BATCH_SIZE = 256 
 
 # --- MODEL DEFINITIONS ---
@@ -30,18 +31,55 @@ class MILHead(nn.Module):
         bag_embedding = torch.sum(x * A, dim=1) 
         return self.bag_classifier(bag_embedding), self.instance_classifier(x), A
 
+def get_weighted_vote(inst_logits, attention, class_list):
+    """
+    Calculates class based on weighted average of individual pill predictions.
+    Robust against abstract hallucinations.
+    """
+    # inst_logits: [1, Num_Pills, Num_Classes]
+    # attention:   [1, Num_Pills, 1]
+    
+    inst_probs = F.softmax(inst_logits, dim=2).squeeze(0) 
+    attn_weights = attention.squeeze(0)
+    
+    # Scale votes by attention (noise pills get near-zero vote)
+    weighted_votes = inst_probs * attn_weights
+    
+    # Sum votes
+    final_bag_score = torch.sum(weighted_votes, dim=0)
+    
+    conf, pred_idx = torch.max(final_bag_score, dim=0)
+    return class_list[pred_idx.item()], conf.item()
+
 def load_backbone(weights_path, device):
-    print(f"--> Loading Backbone...")
+    print(f"--> Loading Backbone from {weights_path}...")
     model = models.resnet34(weights=None)
-    checkpoint = torch.load(weights_path, map_location='cpu')
+    
+    # Load checkpoint
+    try:
+        checkpoint = torch.load(weights_path, map_location='cpu')
+    except FileNotFoundError:
+        print(f"[ERROR] Backbone file not found: {weights_path}")
+        sys.exit(1)
+
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    
+    # Clean keys
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     
+    # Auto-Resize Head to match weights (Critical for loading)
     if 'fc.weight' in new_state_dict:
-        num_classes = new_state_dict['fc.weight'].shape[0]
-        model.fc = nn.Linear(512, num_classes)
-        
-    model.load_state_dict(new_state_dict, strict=False)
+        num_classes_in_ckpt = new_state_dict['fc.weight'].shape[0]
+        model.fc = nn.Linear(512, num_classes_in_ckpt)
+    
+    # Strict Load
+    try:
+        model.load_state_dict(new_state_dict, strict=True)
+    except RuntimeError as e:
+        print(f"\n[CRITICAL ERROR] Backbone Weights Mismatch:\n{e}")
+        sys.exit(1)
+
+    # Remove head for inference
     model.fc = nn.Identity()
     model.to(device)
     model.eval()
@@ -52,6 +90,7 @@ def predict_one_bag(img_paths, backbone, mil_model, device, class_list, transfor
 
     # 1. Extract Features
     features_list = []
+    # Process in chunks
     for i in range(0, len(img_paths), BACKBONE_BATCH_SIZE):
         batch_paths = img_paths[i : i + BACKBONE_BATCH_SIZE]
         images = []
@@ -67,29 +106,33 @@ def predict_one_bag(img_paths, backbone, mil_model, device, class_list, transfor
         with torch.no_grad():
             with torch.cuda.amp.autocast():
                 feats = backbone(img_tensor)
-            features_list.append(feats.float())
+            features_list.append(feats.float()) # Cast to float32
             
     if not features_list: return None
 
     bag_features = torch.cat(features_list, dim=0).unsqueeze(0)
 
-    # 2. MIL Prediction
+    # 2. MIL Inference
     with torch.no_grad():
         bag_logits, inst_logits, attn = mil_model(bag_features)
         
-    # 3. Process Results
+    # 3. Method A: Bag Classifier (Abstract)
     probs = F.softmax(bag_logits, dim=1).squeeze()
-    conf, pred_idx = torch.max(probs, dim=0)
-    predicted_class = class_list[pred_idx.item()]
-    
-    # 4. Foreign Object Check
+    bag_conf, bag_pred_idx = torch.max(probs, dim=0)
+    bag_class = class_list[bag_pred_idx.item()]
+
+    # 4. Method B: Weighted Vote (Robust)
+    vote_class, vote_conf = get_weighted_vote(inst_logits, attn, class_list)
+
+    # 5. Foreign Object Check (Using Vote Class as Ground Truth usually safer)
+    # But standard MIL uses Bag Class. We will use Bag Class for consistency.
     foreign_objects = []
     inst_probs = F.softmax(inst_logits, dim=2).squeeze(0)
     p_confs, p_preds = torch.max(inst_probs, dim=1)
     
     for idx, (p_conf, p_pred) in enumerate(zip(p_confs, p_preds)):
-        # If pill prediction differs from bag prediction AND is confident
-        if p_pred.item() != pred_idx.item() and p_conf.item() > FOREIGN_THRESH:
+        # Conflict: Pill says X, Bag says Y, and Pill is confident
+        if p_pred.item() != bag_pred_idx.item() and p_conf.item() > FOREIGN_THRESH:
             foreign_objects.append({
                 "file": os.path.basename(img_paths[idx]),
                 "predicted_as": class_list[p_pred.item()],
@@ -97,15 +140,17 @@ def predict_one_bag(img_paths, backbone, mil_model, device, class_list, transfor
             })
 
     return {
-        "class": predicted_class,
-        "confidence": conf.item(),
-        "foreign_objects": foreign_objects,
-        "has_foreign": len(foreign_objects) > 0
+        "bag_class": bag_class,
+        "bag_conf": bag_conf.item(),
+        "vote_class": vote_class,
+        "vote_conf": vote_conf,
+        "match": bag_class == vote_class,
+        "foreign_objects": foreign_objects
     }
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_path", type=str, required=True, help="Path to images or folders")
+    parser.add_argument("--input_path", type=str, required=True, help="Folder of images OR Folder of folders")
     parser.add_argument("--backbone_path", type=str, required=True, help="Path to resnet34_ddp_restored.pth")
     parser.add_argument("--mil_path", type=str, required=True, help="Path to mil_final_model.pth")
     args = parser.parse_args()
@@ -113,7 +158,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load Models
-    mil_chk = torch.load(args.mil_path, map_location=device)
+    print("--> Loading Models...")
+    try:
+        mil_chk = torch.load(args.mil_path, map_location=device)
+    except FileNotFoundError:
+        print(f"[ERROR] MIL Model file not found: {args.mil_path}")
+        sys.exit(1)
+        
     class_list = mil_chk['classes']
     mil_model = MILHead(len(class_list), mil_chk.get('input_dim', 512)).to(device)
     mil_model.load_state_dict(mil_chk['model_state_dict'])
@@ -131,37 +182,43 @@ def main():
     direct_jpgs = glob.glob(os.path.join(args.input_path, "*.jpg"))
     tasks = []
     if len(direct_jpgs) > 0:
-        print(f"--> Detected Single Bag Mode")
+        print(f"--> Mode: Single Prescription ({len(direct_jpgs)} images)")
         tasks.append((os.path.basename(args.input_path), direct_jpgs))
     else:
-        print(f"--> Detected Batch Mode")
-        subdirs = [os.path.join(args.input_path, d) for d in os.listdir(args.input_path) if os.path.isdir(os.path.join(args.input_path, d))]
+        print(f"--> Mode: Batch Processing")
+        subdirs = sorted([os.path.join(args.input_path, d) for d in os.listdir(args.input_path) if os.path.isdir(os.path.join(args.input_path, d))])
         for d in subdirs:
             imgs = glob.glob(os.path.join(d, "*.jpg"))
             if imgs: tasks.append((os.path.basename(d), imgs))
+        print(f"--> Found {len(tasks)} prescriptions.")
 
     # Run Inference
-    print("\n" + "="*80)
-    # New Header with Foreign Object Column
-    print(f"{'PRESCRIPTION ID':<25} | {'PREDICTION':<20} | {'CONF %':<8} | {'FOREIGN OBJ':<12}")
-    print("-" * 80)
+    print("\n" + "="*110)
+    print(f"{'ID':<20} | {'BAG PREDICTION':<20} | {'VOTE PREDICTION':<20} | {'AGREE?':<6} | {'FOREIGN OBJ':<12}")
+    print("-" * 110)
     
     for bag_id, img_paths in tasks:
         res = predict_one_bag(img_paths, backbone, mil_model, device, class_list, tfm)
         if res:
-            # Format the Foreign Object Boolean
-            fo_status = "YES (!)" if res['has_foreign'] else "NO"
+            match_icon = "✅" if res['match'] else "⚠️"
+            fo_status = "YES (!)" if res['foreign_objects'] else "NO"
             
-            print(f"{bag_id:<25} | {res['class']:<20} | {res['confidence']:.2%}   | {fo_status:<12}")
+            # Format output line
+            line = f"{bag_id[:20]:<20} | {res['bag_class'][:18]:<18} ({int(res['bag_conf']*100)}%) | {res['vote_class'][:18]:<18} | {match_icon:<6} | {fo_status:<12}"
+            print(line)
             
-            # Print details immediately if YES
-            if res['has_foreign']:
-                print(f"   >>> FOUND {len(res['foreign_objects'])} FOREIGN OBJECTS:")
-                for fo in res['foreign_objects']:
-                    print(f"       - {fo['file']} looks like {fo['predicted_as']} ({float(fo['confidence']):.0%})")
-                print("-" * 80)
+            # Print Details if warnings exist
+            if res['foreign_objects'] or not res['match']:
+                if not res['match']:
+                    print(f"   [WARN] Disagreement! Individual pills look like '{res['vote_class']}' but bag vector looks like '{res['bag_class']}'.")
+                
+                if res['foreign_objects']:
+                    print(f"   [WARN] {len(res['foreign_objects'])} Foreign Objects Detected:")
+                    for fo in res['foreign_objects']:
+                        print(f"       - {fo['file']} -> {fo['predicted_as']} ({float(fo['confidence']):.1%})")
+                print("-" * 110)
 
-    print("="*80)
+    print("="*110)
 
 if __name__ == "__main__":
     main()
