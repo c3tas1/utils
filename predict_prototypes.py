@@ -10,28 +10,40 @@ import sys
 
 # --- CONFIG ---
 BACKBONE_BATCH_SIZE = 256
-# Standard Cosine Similarity Threshold
-# 1.0 = Perfect Match. 0.0 = Orthogonal.
-# Real pills usually score > 0.7. Foreign objects usually score < 0.4.
+# Similarity Threshold using RAW Backbone Features.
+# Since these are raw features, they are distinct. 
+# Real pills > 0.6. Foreign Objects < 0.4.
 SIMILARITY_THRESH = 0.5 
 
-# --- MIL MODEL DEFINITION (To identify the bag class) ---
-class MILHead(nn.Module):
-    def __init__(self, num_classes, input_dim=512):
+# --- TRANSFORMER MODEL (For Classification) ---
+class TransformerMIL(nn.Module):
+    def __init__(self, num_classes, input_dim=512, hidden_dim=512, n_layers=2, n_heads=8, dropout=0.1):
         super().__init__()
-        self.attention_V = nn.Sequential(nn.Linear(input_dim, 128), nn.Tanh())
-        self.attention_U = nn.Sequential(nn.Linear(input_dim, 128), nn.Sigmoid())
-        self.attention_weights = nn.Linear(128, 1)
-        self.bag_classifier = nn.Linear(input_dim, num_classes)
-        self.instance_classifier = nn.Linear(input_dim, num_classes)
+        self.fc_in = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads, 
+            dim_feedforward=hidden_dim*2, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.attn_layer = nn.Sequential(
+            nn.Linear(hidden_dim, 128), nn.Tanh(), nn.Linear(128, 1)
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
 
-    def forward(self, x):
-        A_V = self.attention_V(x)
-        A_U = self.attention_U(x)
-        A = self.attention_weights(A_V * A_U)
-        A = torch.softmax(A, dim=1) 
-        bag_embedding = torch.sum(x * A, dim=1) 
-        return self.bag_classifier(bag_embedding), None, A
+    def forward(self, x, mask=None):
+        h = self.relu(self.fc_in(x))
+        key_padding_mask = (mask == 0) if mask is not None else None
+        h_trans = self.transformer(h, src_key_padding_mask=key_padding_mask)
+        h_trans = self.norm(h_trans)
+        attn_logits = self.attn_layer(h_trans)
+        if mask is not None:
+            attn_logits = attn_logits.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+        attn_weights = torch.softmax(attn_logits, dim=1)
+        bag_embedding = torch.sum(h_trans * attn_weights, dim=1)
+        logits = self.classifier(bag_embedding)
+        return logits
 
 def load_backbone(weights_path, device):
     print(f"--> Loading Backbone...")
@@ -47,10 +59,10 @@ def load_backbone(weights_path, device):
     model.eval()
     return model
 
-def predict_with_prototype(img_paths, backbone, mil_model, prototypes, device, class_list, transform):
+def predict_hybrid(img_paths, backbone, mil_model, prototypes, device, class_list, transform):
     if not img_paths: return None
 
-    # 1. Extract Features
+    # 1. Extract RAW Features (The "Truth")
     features_list = []
     for i in range(0, len(img_paths), BACKBONE_BATCH_SIZE):
         batch_paths = img_paths[i : i+BACKBONE_BATCH_SIZE]
@@ -66,41 +78,42 @@ def predict_with_prototype(img_paths, backbone, mil_model, prototypes, device, c
         with torch.no_grad():
             with torch.cuda.amp.autocast():
                 feats = backbone(img_tensor)
-            # Normalize immediately for cosine similarity
-            feats = F.normalize(feats.float(), p=2, dim=1) 
+            # Normalize Raw Features
+            feats = F.normalize(feats.float(), p=2, dim=1)
             features_list.append(feats)
             
     if not features_list: return None
     
-    # [N, 512] - Individual Pill Vectors
-    all_feats = torch.cat(features_list, dim=0)
-    # [1, N, 512] - For MIL
-    bag_input = all_feats.unsqueeze(0)
-
-    # 2. Identify the Bag Class
+    # Raw Features [N, 512]
+    raw_feats = torch.cat(features_list, dim=0)
+    
+    # 2. Transformer Classification (The "Brain")
+    # Feed raw features into Transformer to get the Class Name
+    bag_input = raw_feats.unsqueeze(0) # [1, N, 512]
+    
     with torch.no_grad():
-        bag_logits, _, _ = mil_model(bag_input)
+        bag_logits = mil_model(bag_input)
         
     probs = F.softmax(bag_logits, dim=1).squeeze()
     bag_conf, bag_pred_idx = torch.max(probs, dim=0)
     predicted_class = class_list[bag_pred_idx.item()]
     
-    # 3. Load the Prototype (The Golden Vector)
+    # 3. Prototype Matching (The "Filter")
+    # Now we compare the RAW features against the RAW Prototype of the predicted class.
+    # We DO NOT use the Transformer output here.
+    
     if predicted_class not in prototypes:
-        return {"error": f"No prototype found for {predicted_class}"}
+        return {"error": f"Prototype missing for {predicted_class}"}
         
     # [1, 512]
     golden_vector = prototypes[predicted_class].to(device).unsqueeze(0)
     
-    # 4. Compare Every Pill to the Golden Vector
-    # Shape: [N, 1]
-    similarities = torch.mm(all_feats, golden_vector.t()).squeeze(1)
+    # Cosine Similarity: [N, 1]
+    similarities = torch.mm(raw_feats, golden_vector.t()).squeeze(1)
     
     foreign_objects = []
-    
     for i in range(len(img_paths)):
         score = similarities[i].item()
-        
         if score < SIMILARITY_THRESH:
             foreign_objects.append({
                 "file": os.path.basename(img_paths[i]),
@@ -115,26 +128,35 @@ def predict_with_prototype(img_paths, backbone, mil_model, prototypes, device, c
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_path", type=str, required=True)
+    parser.add_argument("--input_path", type=str, required=True, help="Path to unknown prescriptions")
     parser.add_argument("--backbone_path", type=str, required=True)
-    parser.add_argument("--mil_path", type=str, required=True)
+    parser.add_argument("--mil_path", type=str, required=True, help="mil_transformer_ddp.pth")
     parser.add_argument("--prototypes_path", type=str, default="class_prototypes.pth")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load Models
+    # Load Transformer (For Class Name)
+    print("--> Loading Transformer...")
     mil_chk = torch.load(args.mil_path, map_location=device)
     class_list = mil_chk['classes']
-    mil_model = MILHead(len(class_list)).to(device)
+    mil_model = TransformerMIL(
+        len(class_list), 
+        hidden_dim=mil_chk.get('hidden_dim', 512),
+        n_layers=mil_chk.get('n_layers', 2),
+        n_heads=mil_chk.get('n_heads', 8)
+    ).to(device)
     mil_model.load_state_dict(mil_chk['model_state_dict'])
     mil_model.eval()
     
+    # Load Backbone (For Raw Features)
     backbone = load_backbone(args.backbone_path, device)
     
-    # Load Prototypes
-    print(f"--> Loading Prototypes from {args.prototypes_path}")
+    # Load Prototypes (For Outlier Detection)
+    if not os.path.exists(args.prototypes_path):
+        sys.exit(f"[ERROR] {args.prototypes_path} not found. Run 'generate_prototypes.py' first.")
     prototypes = torch.load(args.prototypes_path)
+    print(f"--> Loaded {len(prototypes)} Class Prototypes.")
     
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -142,13 +164,13 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Detect Input
+    # Detect Mode
     direct_jpgs = glob.glob(os.path.join(args.input_path, "*.jpg"))
     tasks = []
     if direct_jpgs:
         tasks.append((os.path.basename(args.input_path), direct_jpgs))
     else:
-        subdirs = [os.path.join(args.input_path, d) for d in os.listdir(args.input_path) if os.path.isdir(os.path.join(args.input_path, d))]
+        subdirs = sorted([os.path.join(args.input_path, d) for d in os.listdir(args.input_path) if os.path.isdir(os.path.join(args.input_path, d))])
         for d in subdirs:
             imgs = glob.glob(os.path.join(d, "*.jpg"))
             if imgs: tasks.append((os.path.basename(d), imgs))
@@ -158,7 +180,7 @@ def main():
     print("-" * 80)
     
     for bag_id, img_paths in tasks:
-        res = predict_with_prototype(img_paths, backbone, mil_model, prototypes, device, class_list, tfm)
+        res = predict_hybrid(img_paths, backbone, mil_model, prototypes, device, class_list, tfm)
         
         if "error" in res:
             print(f"{bag_id:<25} | ERROR: {res['error']}")
@@ -171,8 +193,9 @@ def main():
         
         if res['foreign_objects']:
             res['foreign_objects'].sort(key=lambda x: x['score'])
-            for fo in res['foreign_objects']:
-                print(f"   -> {fo['file']} (Similarity: {fo['score']:.4f})")
+            for fo in res['foreign_objects'][:5]:
+                print(f"   -> {fo['file']} (Score: {fo['score']:.4f})")
+            if len(res['foreign_objects']) > 5: print("      ...and others")
             print("-" * 80)
             
     print("="*80)
