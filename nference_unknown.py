@@ -6,14 +6,15 @@ import torch.nn as nn
 from torchvision import transforms, models
 from PIL import Image
 import torch.nn.functional as F
+import pandas as pd
 import sys
 from tqdm import tqdm
 
 # --- CONFIG ---
-FOREIGN_THRESH = 0.95   # Only flag if model is 95% sure it's a different pill
+FOREIGN_THRESH = 0.95   # Confidence to flag a pill as "Wrong"
 BACKBONE_BATCH_SIZE = 256 
 
-# --- MODEL DEFINITIONS ---
+# --- MODEL DEFINITIONS (KEPT EXACTLY AS PROVIDED) ---
 class MILHead(nn.Module):
     def __init__(self, num_classes, input_dim=512):
         super().__init__()
@@ -68,14 +69,12 @@ def load_backbone(weights_path, device):
     model.eval()
     return model
 
-# --- PREDICTION LOGIC (Replaces evaluate_bag) ---
+# --- PREDICTION LOGIC (Formerly evaluate_bag) ---
 def predict_bag(img_paths, backbone, mil_model, device, class_list, transform):
-    if not img_paths: return None
-    
-    # Sort to ensure deterministic results (remove randomness)
+    # Sort to ensure deterministic results (Removed randomness)
     img_paths = sorted(img_paths)
     
-    # 1. Feature Extraction
+    # 1. Feature Extraction (KEPT IDENTICAL)
     features_list = []
     for i in range(0, len(img_paths), BACKBONE_BATCH_SIZE):
         batch_paths = img_paths[i : i + BACKBONE_BATCH_SIZE]
@@ -103,17 +102,15 @@ def predict_bag(img_paths, backbone, mil_model, device, class_list, transform):
         bag_logits, inst_logits, attn = mil_model(bag_features)
 
     # 3. Get Predictions
-    # Method A: Bag Classifier (The main one)
+    # Method A: Bag Classifier
     probs = F.softmax(bag_logits, dim=1).squeeze()
     bag_conf, bag_pred_idx = torch.max(probs, dim=0)
     bag_pred = class_list[bag_pred_idx.item()]
 
-    # Method B: Weighted Vote (Sanity check)
+    # Method B: Weighted Vote
     vote_pred, vote_conf = get_weighted_vote(inst_logits, attn, class_list)
 
-    # 4. Foreign Object Detection
-    # This logic was missing from your test script (since test script focuses on Bag Accuracy).
-    # We add it here to flag disagreements.
+    # 4. Foreign Object Detection (Added for Unknown Prediction)
     foreign_objects = []
     inst_probs = F.softmax(inst_logits, dim=2).squeeze(0)
     p_confs, p_preds = torch.max(inst_probs, dim=1)
@@ -133,13 +130,12 @@ def predict_bag(img_paths, backbone, mil_model, device, class_list, transform):
         "bag_pred": bag_pred,
         "bag_conf": bag_conf.item(),
         "vote_pred": vote_pred,
-        "vote_conf": vote_conf,
         "foreign_objects": foreign_objects
     }
 
 def main():
     parser = argparse.ArgumentParser()
-    # Renamed from test_dir to input_path since we aren't "testing" against GT anymore
+    # Changed argument name from test_dir to input_path
     parser.add_argument("--input_path", type=str, required=True, help="Folder of images OR Folder of folders (prescriptions)")
     parser.add_argument("--backbone_path", type=str, required=True, help="Path to resnet34_ddp_restored.pth")
     parser.add_argument("--mil_path", type=str, required=True, help="Path to mil_final_model.pth")
@@ -169,8 +165,8 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # 4. Detect Input Mode (Single Folder vs Batch of Folders)
-    # Replaces the 'TestDataset' logic
+    # 4. Simple Folder Scanning (Replaces TestDataset)
+    # Detects if input is a single bag (images directly) or batch (folders)
     direct_jpgs = glob.glob(os.path.join(args.input_path, "*.jpg"))
     tasks = []
     
@@ -196,7 +192,7 @@ def main():
     print("-" * 110)
 
     for bag_id, img_paths in tasks:
-        # Run prediction (no GT needed)
+        # Run prediction
         res = predict_bag(img_paths, backbone, mil_model, device, class_list, tfm)
         
         if res:
