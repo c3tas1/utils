@@ -56,7 +56,7 @@ class PaddleOCR:
         self.rec_output = self.rec_model.output(0)
 
     def _load_char_dict(self, dict_path: str) -> List[str]:
-        character = ["blank"]
+        character = []
         with open(dict_path, "r", encoding="utf-8") as f:
             for line in f:
                 character.append(line.strip("\n"))
@@ -221,6 +221,8 @@ class PaddleOCR:
 
     def _rec_postprocess(self, preds: np.ndarray) -> List[Tuple[str, float]]:
         results = []
+        num_classes = preds.shape[2]
+        blank_idx = num_classes - 1
         
         for pred in preds:
             pred_idx = pred.argmax(axis=1)
@@ -228,10 +230,10 @@ class PaddleOCR:
             
             char_list = []
             conf_list = []
-            last_idx = 0
+            last_idx = blank_idx
             
             for idx, prob in zip(pred_idx, pred_prob):
-                if idx != 0 and idx != last_idx:
+                if idx != blank_idx and idx != last_idx:
                     if idx < len(self.character):
                         char_list.append(self.character[idx])
                         conf_list.append(prob)
