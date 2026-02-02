@@ -94,13 +94,19 @@ class PaddleOCR:
             if cv2.contourArea(contour) < 4:
                 continue
             
-            rect = cv2.minAreaRect(contour)
-            box = cv2.boxPoints(rect)
-            box = np.array(box)
+            epsilon = 0.002 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            points = approx.reshape(-1, 2)
+            if len(points) < 4:
+                continue
             
             score = self._box_score(pred, contour)
             if score < self.det_db_box_thresh:
                 continue
+            
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)
+            box = np.array(box)
             
             box = self._unclip(box, self.det_db_unclip_ratio)
             if box is None:
@@ -246,7 +252,47 @@ class PaddleOCR:
         return cropped
 
     def _sort_boxes(self, boxes: List[np.ndarray]) -> List[np.ndarray]:
-        return sorted(boxes, key=lambda b: (b[0][1], b[0][0]))
+        if len(boxes) == 0:
+            return boxes
+        
+        boxes_with_idx = []
+        for i, box in enumerate(boxes):
+            y_center = (box[0][1] + box[2][1]) / 2
+            x_center = (box[0][0] + box[2][0]) / 2
+            boxes_with_idx.append((i, box, y_center, x_center))
+        
+        if len(boxes_with_idx) == 0:
+            return boxes
+        
+        all_heights = []
+        for _, box, _, _ in boxes_with_idx:
+            h = max(np.linalg.norm(box[0] - box[3]), np.linalg.norm(box[1] - box[2]))
+            all_heights.append(h)
+        avg_height = np.mean(all_heights) if all_heights else 20
+        
+        boxes_with_idx.sort(key=lambda x: x[2])
+        
+        lines = []
+        current_line = [boxes_with_idx[0]]
+        
+        for item in boxes_with_idx[1:]:
+            _, _, y_center, _ = item
+            _, _, prev_y, _ = current_line[-1]
+            
+            if abs(y_center - prev_y) < avg_height * 0.5:
+                current_line.append(item)
+            else:
+                lines.append(current_line)
+                current_line = [item]
+        lines.append(current_line)
+        
+        sorted_boxes = []
+        for line in lines:
+            line.sort(key=lambda x: x[3])
+            for item in line:
+                sorted_boxes.append(item[1])
+        
+        return sorted_boxes
 
     def predict(self, img: Union[str, np.ndarray]) -> List[Dict[str, Any]]:
         if isinstance(img, str):
@@ -281,12 +327,11 @@ class PaddleOCR:
         
         results = []
         for box, (text, conf) in zip(valid_boxes, rec_results):
-            if text.strip():
-                results.append({
-                    'text_region': box.tolist(),
-                    'text': text,
-                    'confidence': conf
-                })
+            results.append({
+                'text_region': box.tolist(),
+                'text': text,
+                'confidence': conf
+            })
         
         return results
 
@@ -309,7 +354,7 @@ if __name__ == "__main__":
     
     result = ocr.predict(sys.argv[4])
     
-    print(f"Found {len(result)} text regions:\n")
-    for i, r in enumerate(result):
-        print(f"[{i+1}] {r['text']} ({r['confidence']:.4f})")
-        print(f"    Region: {r['text_region']}\n")
+    texts = []
+    for r in result:
+        texts.append(r['text'].replace("'", ""))
+    print(texts)
