@@ -55,11 +55,11 @@ class PaddleOCR:
         character.append(" ")
         return character
 
-    def _normalize_image(self, img: np.ndarray, scale: float = 1.0/255.0, mean: list = [0.5, 0.5, 0.5], std: list = [0.5, 0.5, 0.5]) -> np.ndarray:
+    def _normalize_image(self, img: np.ndarray) -> np.ndarray:
         img = img.astype(np.float32)
-        img *= scale
-        img -= np.array(mean, dtype=np.float32).reshape(1, 1, 3)
-        img /= np.array(std, dtype=np.float32).reshape(1, 1, 3)
+        img = img / 255.0
+        img -= 0.5
+        img /= 0.5
         return img
 
     def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, dict]:
@@ -268,7 +268,23 @@ class PaddleOCR:
         return results
 
     def _get_rotate_crop_image(self, img: np.ndarray, points: np.ndarray) -> Optional[np.ndarray]:
+        img_height, img_width = img.shape[0:2]
         points = points.astype(np.float32)
+        
+        left = int(np.min(points[:, 0]))
+        right = int(np.max(points[:, 0]))
+        top = int(np.min(points[:, 1]))
+        bottom = int(np.max(points[:, 1]))
+        
+        left = max(0, left - 2)
+        top = max(0, top - 2)
+        right = min(img_width, right + 2)
+        bottom = min(img_height, bottom + 2)
+        
+        img_crop = img[top:bottom, left:right, :].copy()
+        
+        points[:, 0] = points[:, 0] - left
+        points[:, 1] = points[:, 1] - top
         
         img_crop_width = int(max(
             np.linalg.norm(points[0] - points[1]),
@@ -291,7 +307,7 @@ class PaddleOCR:
         
         M = cv2.getPerspectiveTransform(points, pts_std)
         dst_img = cv2.warpPerspective(
-            img,
+            img_crop,
             M,
             (img_crop_width, img_crop_height),
             borderMode=cv2.BORDER_REPLICATE,
@@ -341,11 +357,13 @@ class PaddleOCR:
         dt_boxes = self._sorted_boxes(dt_boxes)
         
         img_crop_list = []
+        valid_boxes = []
         for box in dt_boxes:
             tmp_box = box.copy()
             img_crop = self._get_rotate_crop_image(ori_im, tmp_box)
             if img_crop is not None:
                 img_crop_list.append(img_crop)
+                valid_boxes.append(box)
         
         if not img_crop_list:
             return []
@@ -355,7 +373,7 @@ class PaddleOCR:
         results = []
         for i, (text, score) in enumerate(rec_results):
             results.append({
-                'text_region': dt_boxes[i].tolist(),
+                'text_region': valid_boxes[i].tolist(),
                 'text': text,
                 'confidence': score
             })
