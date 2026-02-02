@@ -1,71 +1,576 @@
+“””
+Drop-in replacement for PaddleOCR using OpenVINO.
+Provides the exact same interface as your original code:
+
+```
+from paddleocr import PaddleOCR
+ocr = PaddleOCR(
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False
+)
+result = ocr.predict("test_img.jpg")
+```
+
+Usage:
+from paddleocr_wrapper import PaddleOCR
+ocr = PaddleOCR(
+use_doc_orientation_classify=False,
+use_doc_unwarping=False,
+use_textline_orientation=False
+)
+result = ocr.predict(“test_img.jpg”)
+“””
+
 import cv2
-import matplotlib.pyplot as plt
-from paddleocr import PaddleOCR, draw_ocr
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Dict, Any, Optional, Union
+from openvino.runtime import Core
+import math
 
-def improve_ocr_performance(image_path):
-    # 1. PREPROCESSING: Add border
-    # PaddleOCR often fails if text is right against the image edge.
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Could not load image at {image_path}")
-        
-    # Add a 50px white border around the image
-    img = cv2.copyMakeBorder(img, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+class PaddleOCR:
+“””
+Drop-in replacement for PaddleOCR using OpenVINO inference.
 
-    # 2. INITIALIZE MODEL WITH TUNED PARAMETERS
-    # These are the specific knobs to turn for "human readable" but "machine missed" text.
-    ocr = PaddleOCR(
-        use_angle_cls=True,          # Essential if text is slightly rotated
-        lang='en',                   # Change if you are processing other languages
+```
+This class provides the same API as paddleocr.PaddleOCR
+but uses OpenVINO IR models instead.
+"""
+
+def __init__(
+    self,
+    # Original PaddleOCR parameters (for compatibility)
+    use_doc_orientation_classify: bool = False,
+    use_doc_unwarping: bool = False,
+    use_textline_orientation: bool = False,
+    # OpenVINO specific parameters
+    model_dir: str = "./models",
+    det_model_name: str = "det_model",
+    rec_model_name: str = "rec_model",
+    cls_model_name: str = "cls_model",
+    char_dict_path: str = None,
+    device: str = "CPU",
+    # Detection parameters
+    det_db_thresh: float = 0.3,
+    det_db_box_thresh: float = 0.6,
+    det_db_unclip_ratio: float = 1.5,
+    det_limit_side_len: int = 960,
+    # Recognition parameters
+    rec_batch_size: int = 6,
+    rec_image_shape: str = "3,48,320",
+    # Classification parameters
+    use_angle_cls: bool = None,
+    cls_batch_size: int = 6,
+    cls_thresh: float = 0.9,
+    **kwargs  # Accept any other parameters for compatibility
+):
+    """
+    Initialize PaddleOCR with OpenVINO backend.
+    
+    Args:
+        use_doc_orientation_classify: Ignored (for API compatibility)
+        use_doc_unwarping: Ignored (for API compatibility)
+        use_textline_orientation: Controls angle classification
+        model_dir: Directory containing OpenVINO IR models
+        det_model_name: Name of detection model (without extension)
+        rec_model_name: Name of recognition model (without extension)
+        cls_model_name: Name of classification model (without extension)
+        char_dict_path: Path to character dictionary
+        device: OpenVINO device (CPU, GPU, etc.)
+    """
+    self.model_dir = Path(model_dir)
+    self.device = device
+    
+    # Map original parameters to OpenVINO parameters
+    self.use_angle_cls = use_textline_orientation if use_angle_cls is None else use_angle_cls
+    
+    # Detection parameters
+    self.det_db_thresh = det_db_thresh
+    self.det_db_box_thresh = det_db_box_thresh
+    self.det_db_unclip_ratio = det_db_unclip_ratio
+    self.det_limit_side_len = det_limit_side_len
+    
+    # Recognition parameters
+    self.rec_batch_size = rec_batch_size
+    self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
+    
+    # Classification parameters
+    self.cls_batch_size = cls_batch_size
+    self.cls_thresh = cls_thresh
+    self.cls_image_shape = [3, 48, 192]
+    
+    # Character dictionary path
+    if char_dict_path is None:
+        char_dict_path = self.model_dir / "ppocr_keys_v1.txt"
+    self.char_dict_path = Path(char_dict_path)
+    
+    # Initialize OpenVINO
+    self.ie = Core()
+    
+    # Load models
+    self._load_models(det_model_name, rec_model_name, cls_model_name)
+    
+    # Load character dictionary
+    self.character = self._load_char_dict()
+
+def _load_models(self, det_name: str, rec_name: str, cls_name: str):
+    """Load all required models"""
+    # Detection model
+    det_path = self.model_dir / f"{det_name}.xml"
+    if det_path.exists():
+        print(f"Loading detection model: {det_path}")
+        model = self.ie.read_model(str(det_path))
+        self.det_model = self.ie.compile_model(model, self.device)
+        self.det_input = self.det_model.input(0)
+        self.det_output = self.det_model.output(0)
+    else:
+        raise FileNotFoundError(f"Detection model not found: {det_path}")
+    
+    # Recognition model
+    rec_path = self.model_dir / f"{rec_name}.xml"
+    if rec_path.exists():
+        print(f"Loading recognition model: {rec_path}")
+        model = self.ie.read_model(str(rec_path))
+        self.rec_model = self.ie.compile_model(model, self.device)
+        self.rec_input = self.rec_model.input(0)
+        self.rec_output = self.rec_model.output(0)
+    else:
+        raise FileNotFoundError(f"Recognition model not found: {rec_path}")
+    
+    # Classification model (optional)
+    cls_path = self.model_dir / f"{cls_name}.xml"
+    if cls_path.exists() and self.use_angle_cls:
+        print(f"Loading classification model: {cls_path}")
+        model = self.ie.read_model(str(cls_path))
+        self.cls_model = self.ie.compile_model(model, self.device)
+        self.cls_input = self.cls_model.input(0)
+        self.cls_output = self.cls_model.output(0)
+    else:
+        self.cls_model = None
+        if self.use_angle_cls:
+            print(f"Warning: Classification model not found: {cls_path}")
+            self.use_angle_cls = False
+
+def _load_char_dict(self) -> List[str]:
+    """Load character dictionary for CTC decoding"""
+    character = []
+    
+    if self.char_dict_path.exists():
+        with open(self.char_dict_path, "r", encoding="utf-8") as f:
+            for line in f:
+                character.append(line.strip("\n"))
+    else:
+        print(f"Warning: Character dictionary not found: {self.char_dict_path}")
+        # Default ASCII character set
+        character = list(
+            "0123456789abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
+        )
+    
+    # Add blank token for CTC
+    return ["blank"] + character
+
+# ==================== Detection ====================
+
+def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Preprocess image for detection"""
+    src_h, src_w = img.shape[:2]
+    
+    # Calculate resize ratio
+    ratio = 1.0
+    if max(src_h, src_w) > self.det_limit_side_len:
+        ratio = self.det_limit_side_len / max(src_h, src_w)
+    
+    resize_h = int(src_h * ratio)
+    resize_w = int(src_w * ratio)
+    
+    # Round to multiple of 32
+    resize_h = max(int(round(resize_h / 32) * 32), 32)
+    resize_w = max(int(round(resize_w / 32) * 32), 32)
+    
+    resized = cv2.resize(img, (resize_w, resize_h))
+    
+    # Normalize (ImageNet normalization)
+    resized = resized.astype(np.float32)
+    mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    resized = (resized / 255.0 - mean) / std
+    
+    # HWC -> NCHW
+    resized = resized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+    
+    return resized, ratio
+
+def _det_postprocess(
+    self, pred: np.ndarray, src_h: int, src_w: int, ratio: float
+) -> List[np.ndarray]:
+    """Extract bounding boxes from detection output"""
+    pred = pred[0, 0]  # Remove batch and channel dims
+    
+    # Threshold
+    segmentation = pred > self.det_db_thresh
+    
+    # Find contours
+    mask = (segmentation * 255).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    boxes = []
+    for contour in contours:
+        if cv2.contourArea(contour) < 10:
+            continue
         
-        # --- DETECTION TUNING ---
-        # If boxes are missing, LOWER these values.
-        det_db_thresh=0.2,           # Default is 0.3. Low contrast text needs lower val.
-        det_db_box_thresh=0.4,       # Default is 0.6. Filters out low-confidence boxes.
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        box = np.int32(box)
         
-        # If boxes are too tight (cutting off first/last letter), INCREASE this.
-        det_db_unclip_ratio=2.0,     # Default is 1.5. Expands the box slightly.
+        # Calculate score
+        score = self._box_score(pred, box)
+        if score < self.det_db_box_thresh:
+            continue
         
-        # If image is high-res (4k+), INCREASE this to avoid downscaling/loss of detail.
-        det_limit_side_len=1280,      # Default is 960.
+        # Unclip
+        box = self._unclip(box, self.det_db_unclip_ratio)
+        if box is None:
+            continue
         
-        # --- RECOGNITION TUNING ---
-        # If using server/GPU, you can swap to the 'server' models here by pointing 
-        # to the specific model directories (det_model_dir, rec_model_dir) usually 
-        # required for the highest accuracy server-side V4 models.
-        # For now, we stick to parameter tuning on the standard model.
+        rect = cv2.minAreaRect(box)
+        if min(rect[1]) < 3:
+            continue
+        
+        box = cv2.boxPoints(rect).astype(np.float32)
+        
+        # Scale back
+        box[:, 0] = np.clip(box[:, 0] / ratio, 0, src_w - 1)
+        box[:, 1] = np.clip(box[:, 1] / ratio, 0, src_h - 1)
+        
+        box = self._order_points(box)
+        boxes.append(box)
+    
+    return boxes
+
+def _box_score(self, bitmap: np.ndarray, box: np.ndarray) -> float:
+    """Calculate mean score inside box"""
+    h, w = bitmap.shape[:2]
+    box = box.copy()
+    
+    xmin = int(np.clip(np.floor(box[:, 0].min()), 0, w - 1))
+    xmax = int(np.clip(np.ceil(box[:, 0].max()), 0, w - 1))
+    ymin = int(np.clip(np.floor(box[:, 1].min()), 0, h - 1))
+    ymax = int(np.clip(np.ceil(box[:, 1].max()), 0, h - 1))
+    
+    mask = np.zeros((ymax - ymin + 1, xmax - xmin + 1), dtype=np.uint8)
+    box[:, 0] -= xmin
+    box[:, 1] -= ymin
+    cv2.fillPoly(mask, box.reshape(1, -1, 2).astype(np.int32), 1)
+    
+    return cv2.mean(bitmap[ymin:ymax + 1, xmin:xmax + 1], mask)[0]
+
+def _unclip(self, box: np.ndarray, ratio: float) -> Optional[np.ndarray]:
+    """Expand box using unclip ratio"""
+    try:
+        import pyclipper
+        poly = box.tolist()
+        area = cv2.contourArea(box)
+        length = cv2.arcLength(box, True)
+        if length == 0:
+            return None
+        distance = area * ratio / length
+        offset = pyclipper.PyclipperOffset()
+        offset.AddPath(poly, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+        expanded = offset.Execute(distance)
+        return np.array(expanded[0]) if expanded else None
+    except ImportError:
+        # Simple expansion fallback
+        center = box.mean(axis=0)
+        return ((box - center) * ratio + center).astype(np.int32)
+
+def _order_points(self, pts: np.ndarray) -> np.ndarray:
+    """Order points: TL, TR, BR, BL"""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def _detect(self, img: np.ndarray) -> List[np.ndarray]:
+    """Run detection inference"""
+    src_h, src_w = img.shape[:2]
+    input_tensor, ratio = self._det_preprocess(img)
+    result = self.det_model({self.det_input: input_tensor})
+    pred = result[self.det_output]
+    return self._det_postprocess(pred, src_h, src_w, ratio)
+
+# ==================== Classification ====================
+
+def _cls_preprocess(self, img: np.ndarray) -> np.ndarray:
+    """Preprocess for classification"""
+    imgC, imgH, imgW = self.cls_image_shape
+    h, w = img.shape[:2]
+    
+    ratio = w / float(h)
+    resized_w = min(imgW, int(math.ceil(imgH * ratio)))
+    
+    resized = cv2.resize(img, (resized_w, imgH))
+    resized = (resized.astype(np.float32) / 255.0 - 0.5) / 0.5
+    
+    padded = np.zeros((imgH, imgW, imgC), dtype=np.float32)
+    padded[:, :resized_w, :] = resized
+    
+    return padded.transpose(2, 0, 1)
+
+def _classify(self, img_list: List[np.ndarray]) -> List[Tuple[str, float]]:
+    """Classify text direction"""
+    if not self.use_angle_cls or self.cls_model is None:
+        return [("0", 1.0)] * len(img_list)
+    
+    results = []
+    for i in range(0, len(img_list), self.cls_batch_size):
+        batch = img_list[i:i + self.cls_batch_size]
+        inputs = np.stack([self._cls_preprocess(img) for img in batch])
+        pred = self.cls_model({self.cls_input: inputs})[self.cls_output]
+        
+        for j in range(len(batch)):
+            idx = pred[j].argmax()
+            score = float(pred[j].max())
+            results.append((str(idx), score))
+    
+    return results
+
+# ==================== Recognition ====================
+
+def _rec_preprocess(self, img: np.ndarray) -> np.ndarray:
+    """Preprocess for recognition"""
+    imgC, imgH, imgW = self.rec_image_shape
+    h, w = img.shape[:2]
+    
+    ratio = w / float(h)
+    resized_w = min(imgW, int(math.ceil(imgH * ratio)))
+    
+    resized = cv2.resize(img, (resized_w, imgH))
+    resized = (resized.astype(np.float32) / 255.0 - 0.5) / 0.5
+    
+    padded = np.zeros((imgH, imgW, imgC), dtype=np.float32)
+    padded[:, :resized_w, :] = resized
+    
+    return padded.transpose(2, 0, 1)
+
+def _rec_postprocess(self, pred: np.ndarray) -> List[Tuple[str, float]]:
+    """CTC decode recognition output"""
+    results = []
+    
+    for b in range(pred.shape[0]):
+        pred_idx = pred[b].argmax(axis=1)
+        
+        chars, confs = [], []
+        prev = 0
+        for t in range(len(pred_idx)):
+            idx = pred_idx[t]
+            if idx != 0 and idx != prev and idx < len(self.character):
+                chars.append(self.character[idx])
+                confs.append(float(pred[b, t, idx]))
+            prev = idx
+        
+        text = "".join(chars)
+        conf = float(np.mean(confs)) if confs else 0.0
+        results.append((text, conf))
+    
+    return results
+
+def _recognize(self, img_list: List[np.ndarray]) -> List[Tuple[str, float]]:
+    """Run recognition inference"""
+    if not img_list:
+        return []
+    
+    results = []
+    for i in range(0, len(img_list), self.rec_batch_size):
+        batch = img_list[i:i + self.rec_batch_size]
+        inputs = np.stack([self._rec_preprocess(img) for img in batch])
+        pred = self.rec_model({self.rec_input: inputs})[self.rec_output]
+        results.extend(self._rec_postprocess(pred))
+    
+    return results
+
+# ==================== Crop ====================
+
+def _crop_image(self, img: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
+    """Crop and straighten text region"""
+    box = box.astype(np.float32)
+    
+    width = int(max(
+        np.linalg.norm(box[0] - box[1]),
+        np.linalg.norm(box[2] - box[3])
+    ))
+    height = int(max(
+        np.linalg.norm(box[0] - box[3]),
+        np.linalg.norm(box[1] - box[2])
+    ))
+    
+    if width < 1 or height < 1:
+        return None
+    
+    dst_pts = np.array([
+        [0, 0], [width - 1, 0],
+        [width - 1, height - 1], [0, height - 1]
+    ], dtype=np.float32)
+    
+    M = cv2.getPerspectiveTransform(box, dst_pts)
+    cropped = cv2.warpPerspective(
+        img, M, (width, height),
+        borderMode=cv2.BORDER_REPLICATE,
+        flags=cv2.INTER_CUBIC
     )
+    
+    if cropped.shape[0] > cropped.shape[1] * 1.5:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_CLOCKWISE)
+    
+    return cropped
 
-    # 3. RUN INFERENCE
-    result = ocr.ocr(img, cls=True)
+def _sort_boxes(self, boxes: List[np.ndarray]) -> List[np.ndarray]:
+    """Sort boxes top-to-bottom, left-to-right"""
+    return sorted(boxes, key=lambda b: (b[0][1], b[0][0]))
 
-    # 4. VISUALIZE RESULTS
-    # This block separates the boxes and scores for visualization
-    if result[0] is None:
-        print("No text detected.")
-        return
+# ==================== Main API ====================
 
-    boxes = [line[0] for line in result[0]]
-    txts = [line[1][0] for line in result[0]]
-    scores = [line[1][1] for line in result[0]]
+def predict(
+    self, 
+    img: Union[str, np.ndarray],
+    cls: bool = None,
+    det: bool = True,
+    rec: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Run OCR on image.
+    
+    Args:
+        img: Image path or numpy array (RGB or BGR)
+        cls: Override angle classification setting
+        det: Run detection
+        rec: Run recognition
+        
+    Returns:
+        List of dictionaries with keys:
+        - text_region: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        - text: recognized text string
+        - confidence: recognition confidence (0-1)
+    """
+    # Load image
+    if isinstance(img, str):
+        image = cv2.imread(img)
+        if image is None:
+            raise ValueError(f"Could not load image: {img}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        image = img.copy()
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    
+    # Detection
+    boxes = self._detect(image)
+    if not boxes:
+        return []
+    
+    boxes = self._sort_boxes(boxes)
+    
+    # Crop
+    crops, valid_boxes = [], []
+    for box in boxes:
+        crop = self._crop_image(image, box)
+        if crop is not None and crop.size > 0:
+            crops.append(crop)
+            valid_boxes.append(box)
+    
+    if not crops:
+        return []
+    
+    # Classification
+    use_cls = cls if cls is not None else self.use_angle_cls
+    if use_cls:
+        cls_results = self._classify(crops)
+        for i, (label, score) in enumerate(cls_results):
+            if label == "1" and score > self.cls_thresh:
+                crops[i] = cv2.rotate(crops[i], cv2.ROTATE_180)
+    
+    # Recognition
+    rec_results = self._recognize(crops)
+    
+    # Format output (matches PaddleOCR format)
+    results = []
+    for box, (text, conf) in zip(valid_boxes, rec_results):
+        if text.strip():
+            results.append({
+                'text_region': box.tolist(),
+                'text': text,
+                'confidence': conf
+            })
+    
+    return results
 
-    # Print raw text for debugging
-    print("\n--- Extracted Text & Confidence ---")
-    for t, s in zip(txts, scores):
-        print(f"[{s:.2f}] {t}")
+def ocr(
+    self, 
+    img: Union[str, np.ndarray],
+    cls: bool = None,
+    det: bool = True,
+    rec: bool = True,
+) -> List[List[Any]]:
+    """
+    Alternative API matching PaddleOCR.ocr() output format.
+    
+    Returns:
+        [
+            [[[x1,y1], [x2,y2], [x3,y3], [x4,y4]], (text, confidence)],
+            ...
+        ]
+    """
+    results = self.predict(img, cls=cls, det=det, rec=rec)
+    
+    return [
+        [r['text_region'], (r['text'], r['confidence'])]
+        for r in results
+    ]
 
-    # Draw the results
-    # Note: You may need to provide a path to a .ttf font file for 'font_path' 
-    # if you are visualizing non-Latin characters.
-    im_show = draw_ocr(img, boxes, txts, scores, font_path=None)
-    im_show = cv2.cvtColor(im_show, cv2.COLOR_BGR2RGB)
+def __call__(
+    self, 
+    img: Union[str, np.ndarray],
+    **kwargs
+) -> List[Dict[str, Any]]:
+    """Alias for predict()"""
+    return self.predict(img, **kwargs)
+```
 
-    # Display using Matplotlib
-    plt.figure(figsize=(12, 12))
-    plt.imshow(im_show)
-    plt.axis('off')
-    plt.title("PaddleOCR Result (Border Added + Tuned Thresholds)")
-    plt.show()
+# ==================== Example ====================
 
-# Replace with your image path
-# improve_ocr_performance('path/to/your/image.jpg')
+if **name** == “**main**”:
+import sys
+
+```
+print("PaddleOCR OpenVINO Drop-in Replacement")
+print("=" * 50)
+
+if len(sys.argv) < 2:
+    print("\nUsage: python paddleocr_wrapper.py <image_path>")
+    print("\nExpected files in ./models/:")
+    print("  - det_model.xml, det_model.bin")
+    print("  - rec_model.xml, rec_model.bin")
+    print("  - ppocr_keys_v1.txt")
+    sys.exit(0)
+
+# Same API as original code
+ocr = PaddleOCR(
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False
+)
+
+result = ocr.predict(sys.argv[1])
+
+print(f"\nFound {len(result)} text regions:\n")
+for i, r in enumerate(result):
+    print(f"[{i+1}] {r['text']} ({r['confidence']:.4f})")
+    print(f"    Region: {r['text_region']}\n")
+```
