@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Any, Optional, Union
 from openvino.runtime import Core
 import math
+import os
 
 
 class PaddleOCR:
@@ -19,6 +20,8 @@ class PaddleOCR:
         det_min_box_size: int = 3,
         rec_batch_size: int = 6,
         rec_image_shape: str = "3,48,320",
+        debug: bool = False,
+        debug_dir: str = "./debug_crops",
         **kwargs
     ):
         self.device = device
@@ -29,6 +32,11 @@ class PaddleOCR:
         self.det_min_box_size = det_min_box_size
         self.rec_batch_size = rec_batch_size
         self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
+        self.debug = debug
+        self.debug_dir = debug_dir
+        
+        if self.debug:
+            os.makedirs(self.debug_dir, exist_ok=True)
         
         self.ie = Core()
         self._load_det_model(det_model_path)
@@ -276,10 +284,10 @@ class PaddleOCR:
         top = int(np.min(points[:, 1]))
         bottom = int(np.max(points[:, 1]))
         
-        left = max(0, left - 2)
-        top = max(0, top - 2)
-        right = min(img_width, right + 2)
-        bottom = min(img_height, bottom + 2)
+        left = max(0, left - 3)
+        top = max(0, top - 3)
+        right = min(img_width, right + 3)
+        bottom = min(img_height, bottom + 3)
         
         img_crop = img[top:bottom, left:right, :].copy()
         
@@ -356,14 +364,25 @@ class PaddleOCR:
         
         dt_boxes = self._sorted_boxes(dt_boxes)
         
+        if self.debug:
+            debug_img = ori_im.copy()
+            for i, box in enumerate(dt_boxes):
+                box_int = box.astype(np.int32)
+                cv2.polylines(debug_img, [box_int], True, (0, 255, 0), 2)
+                cv2.putText(debug_img, str(i), (box_int[0][0], box_int[0][1] - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            cv2.imwrite(os.path.join(self.debug_dir, "detection_boxes.jpg"), debug_img)
+        
         img_crop_list = []
         valid_boxes = []
-        for box in dt_boxes:
+        for i, box in enumerate(dt_boxes):
             tmp_box = box.copy()
             img_crop = self._get_rotate_crop_image(ori_im, tmp_box)
             if img_crop is not None:
                 img_crop_list.append(img_crop)
                 valid_boxes.append(box)
+                if self.debug:
+                    cv2.imwrite(os.path.join(self.debug_dir, f"crop_{i}.jpg"), img_crop)
         
         if not img_crop_list:
             return []
@@ -377,6 +396,8 @@ class PaddleOCR:
                 'text': text,
                 'confidence': score
             })
+            if self.debug:
+                print(f"Crop {i}: '{text}' (conf: {score:.4f})")
         
         return results
 
@@ -388,13 +409,16 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 5:
-        print("Usage: python paddleocr_wrapper.py <det_model.xml> <rec_model.xml> <char_dict.txt> <image_path>")
+        print("Usage: python paddleocr_wrapper.py <det_model.xml> <rec_model.xml> <char_dict.txt> <image_path> [--debug]")
         sys.exit(0)
+    
+    debug_mode = "--debug" in sys.argv
     
     ocr = PaddleOCR(
         det_model_path=sys.argv[1],
         rec_model_path=sys.argv[2],
-        char_dict_path=sys.argv[3]
+        char_dict_path=sys.argv[3],
+        debug=debug_mode
     )
     
     result = ocr.predict(sys.argv[4])
