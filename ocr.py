@@ -180,21 +180,22 @@ class PaddleOCR:
 
     def _crop_text(self, img: np.ndarray, pts: np.ndarray) -> Optional[np.ndarray]:
         h, w = img.shape[:2]
-        pts = pts.astype(np.float32)
+        pts = pts.astype(np.float32).reshape(4, 2)
         
         left, right = max(0, int(pts[:, 0].min()) - 3), min(w, int(pts[:, 0].max()) + 3)
         top, bottom = max(0, int(pts[:, 1].min()) - 3), min(h, int(pts[:, 1].max()) + 3)
         
         crop = img[top:bottom, left:right, :].copy()
-        pts = pts - [left, top]
+        pts_shifted = pts - np.array([left, top], dtype=np.float32)
         
-        cw = int(max(np.linalg.norm(pts[0] - pts[1]), np.linalg.norm(pts[2] - pts[3])))
-        ch = int(max(np.linalg.norm(pts[0] - pts[3]), np.linalg.norm(pts[1] - pts[2])))
+        cw = int(max(np.linalg.norm(pts_shifted[0] - pts_shifted[1]), np.linalg.norm(pts_shifted[2] - pts_shifted[3])))
+        ch = int(max(np.linalg.norm(pts_shifted[0] - pts_shifted[3]), np.linalg.norm(pts_shifted[1] - pts_shifted[2])))
         if cw < 1 or ch < 1:
             return None
         
+        src = pts_shifted.reshape(4, 2).astype(np.float32)
         dst = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(pts, dst)
+        M = cv2.getPerspectiveTransform(src, dst)
         out = cv2.warpPerspective(crop, M, (cw, ch), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
         
         return np.rot90(out) if out.shape[0] / out.shape[1] >= 1.5 else out
