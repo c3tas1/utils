@@ -19,6 +19,7 @@ class PaddleOCR:
         det_min_box_size: int = 3,
         rec_batch_size: int = 6,
         rec_image_shape: str = "3,48,320",
+        use_space_char: bool = True,
         **kwargs
     ):
         self.device = device
@@ -29,6 +30,7 @@ class PaddleOCR:
         self.det_min_box_size = det_min_box_size
         self.rec_batch_size = rec_batch_size
         self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
+        self.use_space_char = use_space_char
         
         self.ie = Core()
         self._load_det_model(det_model_path)
@@ -52,6 +54,8 @@ class PaddleOCR:
         with open(dict_path, "r", encoding="utf-8") as f:
             for line in f:
                 character.append(line.strip("\n"))
+        if self.use_space_char and " " not in character:
+            character.append(" ")
         return ["blank"] + character
 
     def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, Tuple[float, float, int, int]]:
@@ -72,9 +76,7 @@ class PaddleOCR:
         
         resized = cv2.resize(img, (resize_w, resize_h))
         resized = resized.astype(np.float32)
-        mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
-        std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
-        resized = (resized / 255.0 - mean) / std
+        resized = (resized / 255.0 - 0.5) / 0.5
         resized = resized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
         
         return resized, (ratio_h, ratio_w, resize_h, resize_w)
@@ -92,12 +94,6 @@ class PaddleOCR:
         boxes = []
         for contour in contours:
             if cv2.contourArea(contour) < 4:
-                continue
-            
-            epsilon = 0.002 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            points = approx.reshape(-1, 2)
-            if len(points) < 4:
                 continue
             
             score = self._box_score(pred, contour)
@@ -191,15 +187,20 @@ class PaddleOCR:
         pred = result[self.det_output]
         return self._det_postprocess(pred, src_h, src_w, shape_info)
 
-    def _rec_preprocess(self, img: np.ndarray) -> np.ndarray:
+    def _rec_preprocess(self, img: np.ndarray, max_wh_ratio: float = None) -> np.ndarray:
         imgC, imgH, imgW = self.rec_image_shape
-        h, w = img.shape[:2]
+        if max_wh_ratio is not None:
+            imgW = int(imgH * max_wh_ratio)
+            imgW = max(min(imgW, 1280), 32)
         
+        h, w = img.shape[:2]
         ratio = w / float(h)
-        resized_w = min(imgW, int(math.ceil(imgH * ratio)))
+        resized_w = int(math.ceil(imgH * ratio))
+        resized_w = min(resized_w, imgW)
         
         resized = cv2.resize(img, (resized_w, imgH))
-        resized = (resized.astype(np.float32) / 255.0 - 0.5) / 0.5
+        resized = resized.astype(np.float32)
+        resized = (resized / 255.0 - 0.5) / 0.5
         
         padded = np.zeros((imgH, imgW, imgC), dtype=np.float32)
         padded[:, :resized_w, :] = resized
@@ -209,15 +210,20 @@ class PaddleOCR:
     def _rec_postprocess(self, pred: np.ndarray) -> List[Tuple[str, float]]:
         results = []
         for b in range(pred.shape[0]):
-            pred_idx = pred[b].argmax(axis=1)
+            pred_prob = pred[b]
+            pred_idx = pred_prob.argmax(axis=1)
+            pred_scores = pred_prob.max(axis=1)
+            
             chars, confs = [], []
             prev = 0
             for t in range(len(pred_idx)):
-                idx = pred_idx[t]
-                if idx != 0 and idx != prev and idx < len(self.character):
-                    chars.append(self.character[idx])
-                    confs.append(float(pred[b, t, idx]))
+                idx = int(pred_idx[t])
+                if idx != 0 and idx != prev:
+                    if idx < len(self.character):
+                        chars.append(self.character[idx])
+                        confs.append(float(pred_scores[t]))
                 prev = idx
+            
             text = "".join(chars)
             conf = float(np.mean(confs)) if confs else 0.0
             results.append((text, conf))
@@ -226,28 +232,69 @@ class PaddleOCR:
     def _recognize(self, img_list: List[np.ndarray]) -> List[Tuple[str, float]]:
         if not img_list:
             return []
-        results = []
-        for i in range(0, len(img_list), self.rec_batch_size):
-            batch = img_list[i:i + self.rec_batch_size]
-            inputs = np.stack([self._rec_preprocess(img) for img in batch])
-            pred = self.rec_model({self.rec_input: inputs})[self.rec_output]
-            results.extend(self._rec_postprocess(pred))
+        
+        width_list = []
+        for img in img_list:
+            width_list.append(img.shape[1] / float(img.shape[0]))
+        
+        indices = np.argsort(np.array(width_list))
+        
+        results = [None] * len(img_list)
+        batch_num = math.ceil(len(img_list) / self.rec_batch_size)
+        
+        for bn in range(batch_num):
+            start = bn * self.rec_batch_size
+            end = min((bn + 1) * self.rec_batch_size, len(img_list))
+            
+            batch_indices = indices[start:end]
+            max_wh_ratio = max([width_list[i] for i in batch_indices])
+            
+            batch_inputs = []
+            for idx in batch_indices:
+                img = img_list[idx]
+                preprocessed = self._rec_preprocess(img, max_wh_ratio)
+                batch_inputs.append(preprocessed)
+            
+            batch_array = np.stack(batch_inputs)
+            pred = self.rec_model({self.rec_input: batch_array})[self.rec_output]
+            batch_results = self._rec_postprocess(pred)
+            
+            for i, idx in enumerate(batch_indices):
+                results[idx] = batch_results[i]
+        
         return results
 
     def _crop_image(self, img: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
         box = box.astype(np.float32)
-        width = int(max(np.linalg.norm(box[0] - box[1]), np.linalg.norm(box[2] - box[3])))
-        height = int(max(np.linalg.norm(box[0] - box[3]), np.linalg.norm(box[1] - box[2])))
         
-        if width < 1 or height < 1:
+        img_crop_width = int(max(
+            np.linalg.norm(box[0] - box[1]),
+            np.linalg.norm(box[2] - box[3])
+        ))
+        img_crop_height = int(max(
+            np.linalg.norm(box[0] - box[3]),
+            np.linalg.norm(box[1] - box[2])
+        ))
+        
+        if img_crop_width < 1 or img_crop_height < 1:
             return None
         
-        dst_pts = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(box, dst_pts)
-        cropped = cv2.warpPerspective(img, M, (width, height), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
+        dst_pts = np.array([
+            [0, 0],
+            [img_crop_width - 1, 0],
+            [img_crop_width - 1, img_crop_height - 1],
+            [0, img_crop_height - 1]
+        ], dtype=np.float32)
         
-        if cropped.shape[0] > cropped.shape[1] * 1.5:
-            cropped = cv2.rotate(cropped, cv2.ROTATE_90_CLOCKWISE)
+        M = cv2.getPerspectiveTransform(box, dst_pts)
+        cropped = cv2.warpPerspective(
+            img, M, (img_crop_width, img_crop_height),
+            borderMode=cv2.BORDER_REPLICATE,
+            flags=cv2.INTER_CUBIC
+        )
+        
+        if img_crop_height > img_crop_width * 1.5:
+            cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
         
         return cropped
 
@@ -255,42 +302,42 @@ class PaddleOCR:
         if len(boxes) == 0:
             return boxes
         
-        boxes_with_idx = []
+        boxes_info = []
         for i, box in enumerate(boxes):
-            y_center = (box[0][1] + box[2][1]) / 2
-            x_center = (box[0][0] + box[2][0]) / 2
-            boxes_with_idx.append((i, box, y_center, x_center))
+            y_top = min(box[0][1], box[1][1])
+            y_bottom = max(box[2][1], box[3][1])
+            x_left = min(box[0][0], box[3][0])
+            boxes_info.append({
+                'idx': i,
+                'box': box,
+                'y_top': y_top,
+                'y_bottom': y_bottom,
+                'y_center': (y_top + y_bottom) / 2,
+                'x_left': x_left,
+                'height': y_bottom - y_top
+            })
         
-        if len(boxes_with_idx) == 0:
-            return boxes
+        avg_height = np.mean([b['height'] for b in boxes_info])
         
-        all_heights = []
-        for _, box, _, _ in boxes_with_idx:
-            h = max(np.linalg.norm(box[0] - box[3]), np.linalg.norm(box[1] - box[2]))
-            all_heights.append(h)
-        avg_height = np.mean(all_heights) if all_heights else 20
-        
-        boxes_with_idx.sort(key=lambda x: x[2])
+        boxes_info.sort(key=lambda x: x['y_center'])
         
         lines = []
-        current_line = [boxes_with_idx[0]]
+        current_line = [boxes_info[0]]
         
-        for item in boxes_with_idx[1:]:
-            _, _, y_center, _ = item
-            _, _, prev_y, _ = current_line[-1]
-            
-            if abs(y_center - prev_y) < avg_height * 0.5:
-                current_line.append(item)
+        for b in boxes_info[1:]:
+            last_in_line = current_line[-1]
+            if abs(b['y_center'] - last_in_line['y_center']) < avg_height * 0.6:
+                current_line.append(b)
             else:
                 lines.append(current_line)
-                current_line = [item]
+                current_line = [b]
         lines.append(current_line)
         
         sorted_boxes = []
         for line in lines:
-            line.sort(key=lambda x: x[3])
-            for item in line:
-                sorted_boxes.append(item[1])
+            line.sort(key=lambda x: x['x_left'])
+            for b in line:
+                sorted_boxes.append(b['box'])
         
         return sorted_boxes
 
