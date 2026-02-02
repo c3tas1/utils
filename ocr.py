@@ -51,11 +51,12 @@ def __init__(
     cls_model_name: str = "cls_model",
     char_dict_path: str = None,
     device: str = "CPU",
-    # Detection parameters
+    # Detection parameters - matched to PaddleOCR v5 defaults
     det_db_thresh: float = 0.3,
-    det_db_box_thresh: float = 0.6,
-    det_db_unclip_ratio: float = 1.5,
+    det_db_box_thresh: float = 0.5,  # Changed from 0.6 to match PaddleOCR default
+    det_db_unclip_ratio: float = 1.6,  # Changed from 1.5 to match PaddleOCR default
     det_limit_side_len: int = 960,
+    det_min_box_size: int = 3,  # Minimum box size
     # Recognition parameters
     rec_batch_size: int = 6,
     rec_image_shape: str = "3,48,320",
@@ -90,6 +91,7 @@ def __init__(
     self.det_db_box_thresh = det_db_box_thresh
     self.det_db_unclip_ratio = det_db_unclip_ratio
     self.det_limit_side_len = det_limit_side_len
+    self.det_min_box_size = det_min_box_size
     
     # Recognition parameters
     self.rec_batch_size = rec_batch_size
@@ -173,14 +175,17 @@ def _load_char_dict(self) -> List[str]:
 
 # ==================== Detection ====================
 
-def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Preprocess image for detection"""
+def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, Tuple[float, float, int, int]]:
+    """Preprocess image for detection - matches PaddleOCR resize logic"""
     src_h, src_w = img.shape[:2]
     
-    # Calculate resize ratio
+    # Calculate resize ratio while preserving aspect ratio
     ratio = 1.0
     if max(src_h, src_w) > self.det_limit_side_len:
-        ratio = self.det_limit_side_len / max(src_h, src_w)
+        if src_h > src_w:
+            ratio = self.det_limit_side_len / src_h
+        else:
+            ratio = self.det_limit_side_len / src_w
     
     resize_h = int(src_h * ratio)
     resize_w = int(src_w * ratio)
@@ -188,6 +193,10 @@ def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
     # Round to multiple of 32
     resize_h = max(int(round(resize_h / 32) * 32), 32)
     resize_w = max(int(round(resize_w / 32) * 32), 32)
+    
+    # Calculate actual ratios after rounding
+    ratio_h = resize_h / src_h
+    ratio_w = resize_w / src_w
     
     resized = cv2.resize(img, (resize_w, resize_h))
     
@@ -200,90 +209,122 @@ def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
     # HWC -> NCHW
     resized = resized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
     
-    return resized, ratio
+    return resized, (ratio_h, ratio_w, resize_h, resize_w)
 
 def _det_postprocess(
-    self, pred: np.ndarray, src_h: int, src_w: int, ratio: float
+    self, pred: np.ndarray, src_h: int, src_w: int, shape_info: Tuple[float, float, int, int]
 ) -> List[np.ndarray]:
-    """Extract bounding boxes from detection output"""
+    """Extract bounding boxes from detection output - matches PaddleOCR DBPostProcess"""
+    ratio_h, ratio_w, resize_h, resize_w = shape_info
     pred = pred[0, 0]  # Remove batch and channel dims
-    
-    # Threshold
     segmentation = pred > self.det_db_thresh
     
-    # Find contours
+    # Find contours on the binary mask
     mask = (segmentation * 255).astype(np.uint8)
     contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     boxes = []
+    scores = []
+    
     for contour in contours:
-        if cv2.contourArea(contour) < 10:
+        # Filter by contour area (very small regions)
+        if cv2.contourArea(contour) < 4:
             continue
         
+        # Get minimum area rectangle
         rect = cv2.minAreaRect(contour)
         box = cv2.boxPoints(rect)
-        box = np.int32(box)
+        box = np.array(box)
         
-        # Calculate score
-        score = self._box_score(pred, box)
+        # Calculate box score from the probability map
+        score = self._box_score(pred, contour)
         if score < self.det_db_box_thresh:
             continue
         
-        # Unclip
+        # Unclip the box to expand it
         box = self._unclip(box, self.det_db_unclip_ratio)
         if box is None:
             continue
         
+        # Get the minimum area rect of the expanded box
+        box = box.reshape(-1, 2)
         rect = cv2.minAreaRect(box)
-        if min(rect[1]) < 3:
+        box = cv2.boxPoints(rect)
+        box = np.array(box)
+        
+        # Filter by minimum size
+        if min(rect[1]) < self.det_min_box_size:
             continue
         
-        box = cv2.boxPoints(rect).astype(np.float32)
-        
-        # Scale back
-        box[:, 0] = np.clip(box[:, 0] / ratio, 0, src_w - 1)
-        box[:, 1] = np.clip(box[:, 1] / ratio, 0, src_h - 1)
-        
+        # Order the points consistently
         box = self._order_points(box)
-        boxes.append(box)
+        
+        # Scale coordinates back to original image size using separate ratios
+        box[:, 0] = box[:, 0] / ratio_w
+        box[:, 1] = box[:, 1] / ratio_h
+        
+        # Clip to image boundaries
+        box[:, 0] = np.clip(box[:, 0], 0, src_w - 1)
+        box[:, 1] = np.clip(box[:, 1], 0, src_h - 1)
+        
+        boxes.append(box.astype(np.float32))
+        scores.append(score)
     
     return boxes
 
-def _box_score(self, bitmap: np.ndarray, box: np.ndarray) -> float:
-    """Calculate mean score inside box"""
+def _box_score(self, bitmap: np.ndarray, contour: np.ndarray) -> float:
+    """Calculate mean score inside contour - matches PaddleOCR implementation"""
     h, w = bitmap.shape[:2]
-    box = box.copy()
+    contour = contour.reshape(-1, 2)
     
-    xmin = int(np.clip(np.floor(box[:, 0].min()), 0, w - 1))
-    xmax = int(np.clip(np.ceil(box[:, 0].max()), 0, w - 1))
-    ymin = int(np.clip(np.floor(box[:, 1].min()), 0, h - 1))
-    ymax = int(np.clip(np.ceil(box[:, 1].max()), 0, h - 1))
+    xmin = np.clip(np.floor(contour[:, 0].min()).astype(np.int32), 0, w - 1)
+    xmax = np.clip(np.ceil(contour[:, 0].max()).astype(np.int32), 0, w - 1)
+    ymin = np.clip(np.floor(contour[:, 1].min()).astype(np.int32), 0, h - 1)
+    ymax = np.clip(np.ceil(contour[:, 1].max()).astype(np.int32), 0, h - 1)
+    
+    if xmax <= xmin or ymax <= ymin:
+        return 0.0
     
     mask = np.zeros((ymax - ymin + 1, xmax - xmin + 1), dtype=np.uint8)
-    box[:, 0] -= xmin
-    box[:, 1] -= ymin
-    cv2.fillPoly(mask, box.reshape(1, -1, 2).astype(np.int32), 1)
+    
+    # Shift contour to local coordinates
+    contour_shifted = contour.copy()
+    contour_shifted[:, 0] = contour_shifted[:, 0] - xmin
+    contour_shifted[:, 1] = contour_shifted[:, 1] - ymin
+    
+    cv2.fillPoly(mask, [contour_shifted.astype(np.int32)], 1)
     
     return cv2.mean(bitmap[ymin:ymax + 1, xmin:xmax + 1], mask)[0]
 
 def _unclip(self, box: np.ndarray, ratio: float) -> Optional[np.ndarray]:
-    """Expand box using unclip ratio"""
+    """Expand box using unclip ratio - matches PaddleOCR implementation"""
+    box = box.reshape(-1, 2)
+    area = cv2.contourArea(box)
+    length = cv2.arcLength(box, True)
+    
+    if length == 0:
+        return None
+    
+    distance = area * ratio / length
+    
     try:
         import pyclipper
-        poly = box.tolist()
-        area = cv2.contourArea(box)
-        length = cv2.arcLength(box, True)
-        if length == 0:
-            return None
-        distance = area * ratio / length
         offset = pyclipper.PyclipperOffset()
-        offset.AddPath(poly, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+        offset.AddPath(box.astype(np.int64).tolist(), pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
         expanded = offset.Execute(distance)
-        return np.array(expanded[0]) if expanded else None
+        
+        if not expanded:
+            return None
+        
+        # Get the largest expanded polygon
+        expanded = sorted(expanded, key=lambda x: cv2.contourArea(np.array(x)), reverse=True)
+        return np.array(expanded[0]).reshape(-1, 2)
+        
     except ImportError:
-        # Simple expansion fallback
+        # Fallback: simple centroid-based expansion
         center = box.mean(axis=0)
-        return ((box - center) * ratio + center).astype(np.int32)
+        expanded = center + (box - center) * (1 + distance / max(np.linalg.norm(box - center, axis=1).mean(), 1e-6))
+        return expanded.astype(np.float32)
 
 def _order_points(self, pts: np.ndarray) -> np.ndarray:
     """Order points: TL, TR, BR, BL"""
@@ -299,10 +340,10 @@ def _order_points(self, pts: np.ndarray) -> np.ndarray:
 def _detect(self, img: np.ndarray) -> List[np.ndarray]:
     """Run detection inference"""
     src_h, src_w = img.shape[:2]
-    input_tensor, ratio = self._det_preprocess(img)
+    input_tensor, shape_info = self._det_preprocess(img)
     result = self.det_model({self.det_input: input_tensor})
     pred = result[self.det_output]
-    return self._det_postprocess(pred, src_h, src_w, ratio)
+    return self._det_postprocess(pred, src_h, src_w, shape_info)
 
 # ==================== Classification ====================
 
