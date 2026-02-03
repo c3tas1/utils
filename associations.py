@@ -7,23 +7,25 @@ def associate_mist_shelf_labels(detections, img_height):
     associations = []
     MAX_V_GAP = img_height * 0.15
     
-    for t_idx, t_box in enumerate(targets.xyxy):
-        t_x1, t_y1, t_x2, t_y2 = t_box
-        t_cx = (t_x1 + t_x2) / 2
-        t_cy = (t_y1 + t_y2) / 2
-        t_width = t_x2 - t_x1
-        t_height = t_y2 - t_y1
-        is_empty = targets.class_id[t_idx] == 1
+    # --- CHANGED: First, find the best target for EACH label ---
+    # This prevents multiple targets from fighting over labels incorrectly
+    label_to_target = {}  # label_idx -> (best_target_idx, score)
+    
+    for l_idx, l_box in enumerate(labels.xyxy):
+        l_x1, l_y1, l_x2, l_y2 = l_box
+        l_cx = (l_x1 + l_x2) / 2
+        l_cy = (l_y1 + l_y2) / 2
+        l_width = l_x2 - l_x1
+        l_height = l_y2 - l_y1
         
-        best_idx, min_score = -1, float('inf')
-        multi_matches = []
+        best_t_idx = -1
+        best_score = float('inf')
         
-        for l_idx, l_box in enumerate(labels.xyxy):
-            l_x1, l_y1, l_x2, l_y2 = l_box
-            l_cx = (l_x1 + l_x2) / 2
-            l_cy = (l_y1 + l_y2) / 2
-            l_width = l_x2 - l_x1
-            l_height = l_y2 - l_y1
+        for t_idx, t_box in enumerate(targets.xyxy):
+            t_x1, t_y1, t_x2, t_y2 = t_box
+            t_cx = (t_x1 + t_x2) / 2
+            t_cy = (t_y1 + t_y2) / 2
+            t_width = t_x2 - t_x1
             
             v_gap = l_y1 - t_y2
             
@@ -35,90 +37,102 @@ def associate_mist_shelf_labels(detections, img_height):
             
             label_below_target_center = l_cy > t_cy
             boxes_overlap = overlap_x > 0 and overlap_y > 0
+            label_center_within = t_x1 <= l_cx <= t_x2
             
-            is_valid_position = False
+            # Position validation
+            is_valid = False
             
             if v_gap >= 0 and v_gap <= MAX_V_GAP:
-                is_valid_position = True
-                position_type = "below"
-                
+                is_valid = True
             elif boxes_overlap and label_below_target_center:
                 v_overlap_ratio = overlap_y / l_height if l_height > 0 else 0
                 if v_overlap_ratio < 0.2 and l_cx > t_cx:
                     continue
-                
-                is_valid_position = True
-                position_type = "overlapping"
-                
+                is_valid = True
             elif v_gap >= -l_height * 0.5 and v_gap < 0:
                 if h_overlap_ratio > 0.3 or h_dist < t_width * 0.5:
-                    is_valid_position = True
-                    position_type = "partial_overlap"
+                    is_valid = True
             
-            if not is_valid_position:
+            if not is_valid:
                 continue
             
             if h_dist > t_width * 0.75 and h_overlap_ratio < 0.15:
                 continue
             
-            if is_empty:
-                if h_overlap_ratio > 0.2 or h_dist < t_width * 0.5:
-                    multi_matches.append({
-                        "label_id": l_idx,
-                        "label_xyxy": l_box,
-                        "target_type": "Empty",
-                        "target_xyxy": t_box,
-                        "position_type": position_type
-                    })
+            # --- CHANGED: Simplified scoring ---
+            # Priority 1: Label center is within target horizontal span (best case)
+            # Priority 2: Horizontal distance (closer = better)
+            # Priority 3: Small vertical gap bonus
+            
+            if label_center_within:
+                score = h_dist  # Pure horizontal distance, will be small
             else:
-                if position_type == "overlapping":
-                    score = h_dist * 1.5 + abs(l_cy - t_cy) * 0.5
-                    score -= h_overlap_ratio * 100
-                elif position_type == "partial_overlap":
-                    score = h_dist + abs(v_gap) * 0.5
-                    score -= h_overlap_ratio * 50
-                else:
-                    score = h_dist + v_gap * 0.3
-                    score -= h_overlap_ratio * 50
-                
-                if score < min_score:
-                    min_score = score
-                    best_idx = l_idx
+                score = h_dist + t_width  # Penalty for label center outside target
+            
+            score += v_gap * 0.1  # Small vertical tiebreaker
+            
+            if score < best_score:
+                best_score = score
+                best_t_idx = t_idx
         
-        if is_empty and multi_matches:
-            associations.extend(multi_matches)
-        elif not is_empty and best_idx != -1:
+        if best_t_idx != -1:
+            label_to_target[l_idx] = (best_t_idx, best_score)
+    
+    # --- CHANGED: Build associations from label perspective ---
+    # Each label maps to exactly one target (the one most directly above it)
+    target_to_labels = {}  # target_idx -> list of (label_idx, score)
+    for l_idx, (t_idx, score) in label_to_target.items():
+        if t_idx not in target_to_labels:
+            target_to_labels[t_idx] = []
+        target_to_labels[t_idx].append((l_idx, score))
+    
+    # For each target, pick the best label (or multiple for empties)
+    for t_idx, t_box in enumerate(targets.xyxy):
+        is_empty = targets.class_id[t_idx] == 1
+        
+        if t_idx not in target_to_labels:
+            continue
+        
+        candidate_labels = target_to_labels[t_idx]
+        
+        if is_empty:
+            for l_idx, score in candidate_labels:
+                associations.append({
+                    "label_id": l_idx,
+                    "label_xyxy": labels.xyxy[l_idx],
+                    "target_type": "Empty",
+                    "target_xyxy": t_box
+                })
+        else:
+            # Pick the single best label
+            best_l_idx, _ = min(candidate_labels, key=lambda x: x[1])
             associations.append({
-                "label_id": best_idx,
-                "label_xyxy": labels.xyxy[best_idx],
+                "label_id": best_l_idx,
+                "label_xyxy": labels.xyxy[best_l_idx],
                 "target_type": "Object",
                 "target_xyxy": t_box
             })
     
-    # --- Post-process: targets with no direct label underneath ---
-    # inherit the nearest label from the left (same product facing)
+    # --- Post-process: targets with no label get left neighbor's label ---
     ROW_THRESHOLD = img_height * 0.05
     
-    def has_direct_label_underneath(t_box):
-        t_x1, t_y1, t_x2, t_y2 = t_box
-        t_cx = (t_x1 + t_x2) / 2
-        t_width = t_x2 - t_x1
-        
-        for l_box in labels.xyxy:
-            l_x1, l_y1, l_x2, l_y2 = l_box
-            l_cx = (l_x1 + l_x2) / 2
-            l_width = l_x2 - l_x1
-            
-            v_gap = l_y1 - t_y2
-            overlap_x = max(0, min(t_x2, l_x2) - max(t_x1, l_x1))
-            h_overlap_ratio = overlap_x / l_width if l_width > 0 else 0
-            
-            label_center_within = t_x1 <= l_cx <= t_x2
-            
-            if 0 <= v_gap <= MAX_V_GAP and (h_overlap_ratio > 0.3 or label_center_within):
-                return True
-        return False
+    all_target_indices = set(range(len(targets.xyxy)))
+    matched_target_indices = set(a_t_idx for a_t_idx in 
+        [next((t_i for t_i in range(len(targets.xyxy)) 
+               if (targets.xyxy[t_i] == a['target_xyxy']).all()), None) 
+         for a in associations] if a_t_idx is not None)
     
+    # Add unmatched targets with no label
+    unmatched = all_target_indices - matched_target_indices
+    for t_idx in unmatched:
+        associations.append({
+            "label_id": -1,
+            "label_xyxy": None,
+            "target_type": "Empty" if targets.class_id[t_idx] == 1 else "Object",
+            "target_xyxy": targets.xyxy[t_idx]
+        })
+    
+    # Group into rows and inherit from left
     sorted_assocs = sorted(associations, key=lambda a: a['target_xyxy'][1])
     
     if sorted_assocs:
@@ -140,7 +154,7 @@ def associate_mist_shelf_labels(detections, img_height):
             
             last_good_label = None
             for assoc in row_sorted:
-                if has_direct_label_underneath(assoc['target_xyxy']):
+                if assoc['label_id'] != -1:
                     last_good_label = assoc
                     final_associations.append(assoc)
                 else:
