@@ -43,11 +43,8 @@ def associate_mist_shelf_labels(detections, img_height):
                 position_type = "below"
                 
             elif boxes_overlap and label_below_target_center:
-                # --- CHANGED: handle small overlap ---
                 v_overlap_ratio = overlap_y / l_height if l_height > 0 else 0
                 if v_overlap_ratio < 0.2 and l_cx > t_cx:
-                    # Less than 20% under this target AND label is to the right
-                    # This label belongs to this target's right neighbor, skip
                     continue
                 
                 is_valid_position = True
@@ -88,7 +85,6 @@ def associate_mist_shelf_labels(detections, img_height):
                     min_score = score
                     best_idx = l_idx
         
-        # Finalize assignment
         if is_empty and multi_matches:
             associations.extend(multi_matches)
         elif not is_empty and best_idx != -1:
@@ -98,18 +94,11 @@ def associate_mist_shelf_labels(detections, img_height):
                 "target_type": "Object",
                 "target_xyxy": t_box
             })
-        # --- Post-process: targets with no label directly underneath ---
-    # share the nearest label to their left
+    
+    # --- Post-process: targets with no direct label underneath ---
+    # inherit the nearest label from the left (same product facing)
     ROW_THRESHOLD = img_height * 0.05
     
-    # Build set of label_ids that are "directly below" a target
-    # (i.e., the label was matched via "below" position_type with good overlap)
-    direct_label_map = {}  # target_key -> label_id
-    for a in associations:
-        t_key = tuple(a['target_xyxy'].tolist()) if hasattr(a['target_xyxy'], 'tolist') else tuple(a['target_xyxy'])
-        direct_label_map[t_key] = a['label_id']
-    
-    # Check which targets have a label directly underneath them
     def has_direct_label_underneath(t_box):
         t_x1, t_y1, t_x2, t_y2 = t_box
         t_cx = (t_x1 + t_x2) / 2
@@ -124,14 +113,12 @@ def associate_mist_shelf_labels(detections, img_height):
             overlap_x = max(0, min(t_x2, l_x2) - max(t_x1, l_x1))
             h_overlap_ratio = overlap_x / l_width if l_width > 0 else 0
             
-            # Label is directly underneath if:
-            # - small vertical gap
-            # - good horizontal overlap (label mostly under this target)
-            if 0 <= v_gap <= MAX_V_GAP and h_overlap_ratio > 0.5:
+            label_center_within = t_x1 <= l_cx <= t_x2
+            
+            if 0 <= v_gap <= MAX_V_GAP and (h_overlap_ratio > 0.3 or label_center_within):
                 return True
         return False
     
-    # Group into rows
     sorted_assocs = sorted(associations, key=lambda a: a['target_xyxy'][1])
     
     if sorted_assocs:
@@ -154,23 +141,17 @@ def associate_mist_shelf_labels(detections, img_height):
             last_good_label = None
             for assoc in row_sorted:
                 if has_direct_label_underneath(assoc['target_xyxy']):
-                    # This target has its own label — use it, and update anchor
                     last_good_label = assoc
                     final_associations.append(assoc)
                 else:
-                    # No label underneath — inherit from last target 
-                    # that had a direct label (to the left)
                     if last_good_label is not None:
                         merged = assoc.copy()
                         merged['label_id'] = last_good_label['label_id']
                         merged['label_xyxy'] = last_good_label['label_xyxy']
                         final_associations.append(merged)
                     else:
-                        # No label to the left either, keep original
                         final_associations.append(assoc)
         
         associations = final_associations
     
     return associations
-
-    
