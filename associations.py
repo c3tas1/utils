@@ -98,17 +98,44 @@ def associate_mist_shelf_labels(detections, img_height):
                 "target_type": "Object",
                 "target_xyxy": t_box
             })
-    
-    # --- NEW: Post-process to handle same-product facings ---
-    # If consecutive targets on same row have no label between them,
-    # they share the leftmost label (same product facing)
+        # --- Post-process: targets with no label directly underneath ---
+    # share the nearest label to their left
     ROW_THRESHOLD = img_height * 0.05
     
-    # Group associations by row
-    rows = []
+    # Build set of label_ids that are "directly below" a target
+    # (i.e., the label was matched via "below" position_type with good overlap)
+    direct_label_map = {}  # target_key -> label_id
+    for a in associations:
+        t_key = tuple(a['target_xyxy'].tolist()) if hasattr(a['target_xyxy'], 'tolist') else tuple(a['target_xyxy'])
+        direct_label_map[t_key] = a['label_id']
+    
+    # Check which targets have a label directly underneath them
+    def has_direct_label_underneath(t_box):
+        t_x1, t_y1, t_x2, t_y2 = t_box
+        t_cx = (t_x1 + t_x2) / 2
+        t_width = t_x2 - t_x1
+        
+        for l_box in labels.xyxy:
+            l_x1, l_y1, l_x2, l_y2 = l_box
+            l_cx = (l_x1 + l_x2) / 2
+            l_width = l_x2 - l_x1
+            
+            v_gap = l_y1 - t_y2
+            overlap_x = max(0, min(t_x2, l_x2) - max(t_x1, l_x1))
+            h_overlap_ratio = overlap_x / l_width if l_width > 0 else 0
+            
+            # Label is directly underneath if:
+            # - small vertical gap
+            # - good horizontal overlap (label mostly under this target)
+            if 0 <= v_gap <= MAX_V_GAP and h_overlap_ratio > 0.5:
+                return True
+        return False
+    
+    # Group into rows
     sorted_assocs = sorted(associations, key=lambda a: a['target_xyxy'][1])
     
     if sorted_assocs:
+        rows = []
         current_row = [sorted_assocs[0]]
         for assoc in sorted_assocs[1:]:
             curr_cy = (assoc['target_xyxy'][1] + assoc['target_xyxy'][3]) / 2
@@ -120,44 +147,30 @@ def associate_mist_shelf_labels(detections, img_height):
                 current_row = [assoc]
         rows.append(current_row)
         
-        # Within each row, merge consecutive targets with no label between them
         final_associations = []
         for row in rows:
             row_sorted = sorted(row, key=lambda a: a['target_xyxy'][0])
             
-            i = 0
-            while i < len(row_sorted):
-                anchor = row_sorted[i]
-                final_associations.append(anchor)
-                
-                j = i + 1
-                while j < len(row_sorted):
-                    prev_box = row_sorted[j - 1]['target_xyxy']
-                    curr_box = row_sorted[j]['target_xyxy']
-                    
-                    # Check if any label center sits between these two targets
-                    mid_left = prev_box[2]   # right edge of previous
-                    mid_right = curr_box[0]  # left edge of current
-                    
-                    has_label_between = False
-                    for l_box in labels.xyxy:
-                        l_cx_check = (l_box[0] + l_box[2]) / 2
-                        if mid_left < l_cx_check < mid_right:
-                            has_label_between = True
-                            break
-                    
-                    if not has_label_between:
-                        # Same facing — assign anchor's label
-                        merged = row_sorted[j].copy()
-                        merged['label_id'] = anchor['label_id']
-                        merged['label_xyxy'] = anchor['label_xyxy']
+            last_good_label = None
+            for assoc in row_sorted:
+                if has_direct_label_underneath(assoc['target_xyxy']):
+                    # This target has its own label — use it, and update anchor
+                    last_good_label = assoc
+                    final_associations.append(assoc)
+                else:
+                    # No label underneath — inherit from last target 
+                    # that had a direct label (to the left)
+                    if last_good_label is not None:
+                        merged = assoc.copy()
+                        merged['label_id'] = last_good_label['label_id']
+                        merged['label_xyxy'] = last_good_label['label_xyxy']
                         final_associations.append(merged)
-                        j += 1
                     else:
-                        break
-                
-                i = j
+                        # No label to the left either, keep original
+                        final_associations.append(assoc)
         
         associations = final_associations
     
     return associations
+
+    
