@@ -25,42 +25,35 @@ def associate_mist_shelf_labels(detections, img_height):
             l_width = l_x2 - l_x1
             l_height = l_y2 - l_y1
             
-            # Calculate vertical relationship
-            v_gap = l_y1 - t_y2  # Positive if label fully below target
+            v_gap = l_y1 - t_y2
             
-            # Calculate overlap between boxes
             overlap_x = max(0, min(t_x2, l_x2) - max(t_x1, l_x1))
             overlap_y = max(0, min(t_y2, l_y2) - max(t_y1, l_y1))
             
-            # Horizontal metrics
             h_dist = abs(l_cx - t_cx)
             h_overlap_ratio = overlap_x / l_width if l_width > 0 else 0
-            
-            # NEW: Check if label is in valid position relative to target
-            # Valid positions:
-            # 1. Below target (v_gap >= 0)
-            # 2. Overlapping with target (overlap_y > 0) AND label center is in lower half of target or below
-            # 3. Slightly above but very close (v_gap >= -small_threshold)
             
             label_below_target_center = l_cy > t_cy
             boxes_overlap = overlap_x > 0 and overlap_y > 0
             
-            # Determine if this is a valid spatial relationship
             is_valid_position = False
             
             if v_gap >= 0 and v_gap <= MAX_V_GAP:
-                # Case 1: Label is cleanly below target
                 is_valid_position = True
                 position_type = "below"
                 
             elif boxes_overlap and label_below_target_center:
-                # Case 2: Boxes overlap but label center is in lower portion
+                # --- CHANGED: handle small overlap ---
+                v_overlap_ratio = overlap_y / l_height if l_height > 0 else 0
+                if v_overlap_ratio < 0.2 and l_cx > t_cx:
+                    # Less than 20% under this target AND label is to the right
+                    # This label belongs to this target's right neighbor, skip
+                    continue
+                
                 is_valid_position = True
                 position_type = "overlapping"
                 
             elif v_gap >= -l_height * 0.5 and v_gap < 0:
-                # Case 3: Label slightly overlaps from below (partial overlap)
-                # Only valid if there's good horizontal alignment
                 if h_overlap_ratio > 0.3 or h_dist < t_width * 0.5:
                     is_valid_position = True
                     position_type = "partial_overlap"
@@ -68,14 +61,10 @@ def associate_mist_shelf_labels(detections, img_height):
             if not is_valid_position:
                 continue
             
-            # Check horizontal alignment
-            # Label should be roughly under/aligned with target
             if h_dist > t_width * 0.75 and h_overlap_ratio < 0.15:
                 continue
             
-            # Calculate association score (lower = better)
             if is_empty:
-                # Empty slots can span multiple labels
                 if h_overlap_ratio > 0.2 or h_dist < t_width * 0.5:
                     multi_matches.append({
                         "label_id": l_idx,
@@ -85,23 +74,13 @@ def associate_mist_shelf_labels(detections, img_height):
                         "position_type": position_type
                     })
             else:
-                # Single object to single label
-                # Scoring: prioritize horizontal alignment, then vertical proximity
-                
                 if position_type == "overlapping":
-                    # For overlapping boxes, use center-to-center distance
-                    # but weight horizontal more heavily
                     score = h_dist * 1.5 + abs(l_cy - t_cy) * 0.5
-                    # Bonus for good horizontal overlap
                     score -= h_overlap_ratio * 100
-                    
                 elif position_type == "partial_overlap":
-                    # Partial overlap - moderate scoring
                     score = h_dist + abs(v_gap) * 0.5
                     score -= h_overlap_ratio * 50
-                    
-                else:  # "below"
-                    # Standard case: label below target
+                else:
                     score = h_dist + v_gap * 0.3
                     score -= h_overlap_ratio * 50
                 
@@ -119,5 +98,66 @@ def associate_mist_shelf_labels(detections, img_height):
                 "target_type": "Object",
                 "target_xyxy": t_box
             })
+    
+    # --- NEW: Post-process to handle same-product facings ---
+    # If consecutive targets on same row have no label between them,
+    # they share the leftmost label (same product facing)
+    ROW_THRESHOLD = img_height * 0.05
+    
+    # Group associations by row
+    rows = []
+    sorted_assocs = sorted(associations, key=lambda a: a['target_xyxy'][1])
+    
+    if sorted_assocs:
+        current_row = [sorted_assocs[0]]
+        for assoc in sorted_assocs[1:]:
+            curr_cy = (assoc['target_xyxy'][1] + assoc['target_xyxy'][3]) / 2
+            prev_cy = (current_row[-1]['target_xyxy'][1] + current_row[-1]['target_xyxy'][3]) / 2
+            if abs(curr_cy - prev_cy) < ROW_THRESHOLD:
+                current_row.append(assoc)
+            else:
+                rows.append(current_row)
+                current_row = [assoc]
+        rows.append(current_row)
+        
+        # Within each row, merge consecutive targets with no label between them
+        final_associations = []
+        for row in rows:
+            row_sorted = sorted(row, key=lambda a: a['target_xyxy'][0])
+            
+            i = 0
+            while i < len(row_sorted):
+                anchor = row_sorted[i]
+                final_associations.append(anchor)
+                
+                j = i + 1
+                while j < len(row_sorted):
+                    prev_box = row_sorted[j - 1]['target_xyxy']
+                    curr_box = row_sorted[j]['target_xyxy']
+                    
+                    # Check if any label center sits between these two targets
+                    mid_left = prev_box[2]   # right edge of previous
+                    mid_right = curr_box[0]  # left edge of current
+                    
+                    has_label_between = False
+                    for l_box in labels.xyxy:
+                        l_cx_check = (l_box[0] + l_box[2]) / 2
+                        if mid_left < l_cx_check < mid_right:
+                            has_label_between = True
+                            break
+                    
+                    if not has_label_between:
+                        # Same facing — assign anchor's label
+                        merged = row_sorted[j].copy()
+                        merged['label_id'] = anchor['label_id']
+                        merged['label_xyxy'] = anchor['label_xyxy']
+                        final_associations.append(merged)
+                        j += 1
+                    else:
+                        break
+                
+                i = j
+        
+        associations = final_associations
     
     return associations
