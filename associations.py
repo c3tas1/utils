@@ -204,3 +204,58 @@ def associate_sku_labels(
             })
 
     return results
+
+
+    def group_associations_by_row(
+    associations: List[dict],
+    img_height: int,
+    shelf_gap_ratio: float = 0.08,
+) -> List[List[dict]]:
+    """
+    Group associations into shelf rows based on their label_xyxy vertical
+    position, sorted top-to-bottom by row and left-to-right within each row.
+
+    Args:
+        associations: List of association dicts from associate_sku_labels().
+        img_height: Original image height.
+        shelf_gap_ratio: Vertical tolerance for row clustering.
+
+    Returns:
+        List of rows (top to bottom), each row is a list of association
+        dicts sorted left to right by label position.
+    """
+    if not associations:
+        return []
+
+    shelf_gap_tol = img_height * shelf_gap_ratio
+
+    def label_cy(assoc):
+        bbox = assoc['label_xyxy']
+        return (bbox[1] + bbox[3]) / 2.0
+
+    def label_left(assoc):
+        return assoc['label_xyxy'][0]
+
+    # sort by label vertical center
+    sorted_assocs = sorted(associations, key=label_cy)
+
+    # cluster into rows
+    rows = []  # each row: list of assoc dicts
+    for assoc in sorted_assocs:
+        a_cy = label_cy(assoc)
+        placed = False
+        for row in rows:
+            row_cy = np.mean([label_cy(a) for a in row])
+            if abs(a_cy - row_cy) < shelf_gap_tol:
+                row.append(assoc)
+                placed = True
+                break
+        if not placed:
+            rows.append([assoc])
+
+    # sort rows top to bottom, associations within each row left to right
+    rows.sort(key=lambda row: np.mean([label_cy(a) for a in row]))
+    for row in rows:
+        row.sort(key=label_left)
+
+    return rows
