@@ -4,7 +4,7 @@ from torchvision import models
 import argparse
 import os
 import sys
-import subprocess
+import openvino as ov  # New Native Import
 
 # --- 1. DEFINE MODEL ARCHITECTURE (Must match training exactly) ---
 class EndToEndMIL(nn.Module):
@@ -24,23 +24,20 @@ class EndToEndMIL(nn.Module):
         self.instance_classifier = nn.Linear(self.input_dim, num_classes)
 
     def forward(self, x):
-        # x shape: [Batch, Bag, 3, 224, 224]
-        # For export, we assume Batch=1 to simplify dynamic axes logic
-        # So input is effectively [1, N, 3, 224, 224]
-        
+        # Input: [1, N, 3, 224, 224]
         batch_size, bag_size, C, H, W = x.shape
         x = x.view(batch_size * bag_size, C, H, W)
         
         # Extract Features
         features = self.feature_extractor(x)
-        features = features.view(batch_size, bag_size, -1) # [1, N, 512]
+        features = features.view(batch_size, bag_size, -1) 
         
-        # A. Instance Predictions
+        # Instance Preds
         flat_features = features.view(-1, self.input_dim)
         instance_logits = self.instance_classifier(flat_features) 
         instance_logits = instance_logits.view(batch_size, bag_size, -1)
         
-        # B. Bag Predictions
+        # Bag Preds
         A_V = self.attention_V(features)
         A_U = self.attention_U(features)
         A = self.attention_weights(A_V * A_U)
@@ -49,7 +46,6 @@ class EndToEndMIL(nn.Module):
         bag_embedding = torch.sum(features * A, dim=1)
         bag_logits = self.bag_classifier(bag_embedding)
         
-        # Return Bag Logits, Instance Logits, Attention Scores
         return bag_logits, instance_logits, A
 
 def main():
@@ -65,34 +61,29 @@ def main():
     except FileNotFoundError:
         sys.exit("Model file not found.")
 
-    # Get class count
     class_list = checkpoint.get('classes')
     if not class_list:
-        # Fallback: try to guess from weight shape if 'classes' key missing
-        print("[WARN] 'classes' key missing in checkpoint. Guessing from weights...")
-        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-        # Find bag_classifier.weight
+        print("[WARN] 'classes' key missing. Trying to infer...")
+        state_dict = checkpoint['model_state_dict']
         key = 'bag_classifier.weight' if 'bag_classifier.weight' in state_dict else 'module.bag_classifier.weight'
         num_classes = state_dict[key].shape[0]
-        print(f"       Guessed {num_classes} classes.")
     else:
         num_classes = len(class_list)
 
     model = EndToEndMIL(num_classes)
     
-    # Clean keys (Remove 'module.')
-    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    # Clean keys
+    state_dict = checkpoint['model_state_dict']
     clean_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(clean_dict, strict=True)
     model.eval()
 
     # 2. Export to ONNX
-    onnx_path = os.path.join(args.output_dir, "mil_model.onnx")
+    # We still use ONNX as the bridge because it handles dynamic axes explicitly well.
     os.makedirs(args.output_dir, exist_ok=True)
+    onnx_path = os.path.join(args.output_dir, "mil_model.onnx")
     
-    print("--> Exporting to ONNX...")
-    
-    # Dummy Input: 1 Bag, 5 Pills, 3 Channels, 224x224
+    print("--> Exporting to ONNX (with dynamic shapes)...")
     dummy_input = torch.randn(1, 5, 3, 224, 224)
     
     torch.onnx.export(
@@ -100,38 +91,32 @@ def main():
         dummy_input,
         onnx_path,
         export_params=True,
-        opset_version=12,
+        opset_version=14, # Newer opset for 2024.x
         input_names=['input_bag'],
         output_names=['bag_logits', 'instance_logits', 'attention'],
         dynamic_axes={
-            'input_bag': {1: 'num_pills'},         # The pill dimension (N) is dynamic
-            'instance_logits': {1: 'num_pills'},   # Output scales with N
-            'attention': {1: 'num_pills'}          # Attention scales with N
+            'input_bag': {1: 'num_pills'},         
+            'instance_logits': {1: 'num_pills'},   
+            'attention': {1: 'num_pills'}          
         }
     )
     print(f"--> ONNX saved to {onnx_path}")
 
-    # 3. Convert ONNX to OpenVINO IR
-    print("--> Converting to OpenVINO IR (FP16)...")
+    # 3. Convert to OpenVINO (The Modern Way)
+    print("--> Converting to OpenVINO IR...")
     
-    # Construct the MO command
-    # FP16 is recommended for inference speed on most Intel hardware
-    cmd = [
-        "mo",
-        "--input_model", onnx_path,
-        "--output_dir", args.output_dir,
-        "--model_name", "mil_model_ir",
-        "--data_type", "FP16" 
-    ]
+    # Core OpenVINO conversion
+    ov_model = ov.convert_model(onnx_path)
     
-    try:
-        subprocess.check_call(cmd)
-        print(f"\n[SUCCESS] OpenVINO model saved to {args.output_dir}")
-        print(f"FILES: mil_model_ir.xml, mil_model_ir.bin")
-    except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] Model Optimizer failed. Ensure 'openvino-dev' is installed.")
-        print("You can try running manually:")
-        print(f"mo --input_model {onnx_path} --output_dir {args.output_dir} --data_type FP16")
+    # Save with FP16 Compression (This replaces --data_type FP16)
+    ir_path = os.path.join(args.output_dir, "mil_model_ir.xml")
+    
+    # compress_to_fp16=True is the new way to get FP16 weights
+    ov.save_model(ov_model, ir_path, compress_to_fp16=True)
+    
+    print(f"\n[SUCCESS] OpenVINO model saved to {ir_path}")
+    print(f"Weights saved to {ir_path.replace('.xml', '.bin')}")
+    print("Optimization: FP16 (Half Precision)")
 
 if __name__ == "__main__":
     main()
