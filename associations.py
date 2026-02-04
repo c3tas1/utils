@@ -13,6 +13,17 @@ LABEL_CLASSES = {'SkuLabel', 'Reflection'}
 TARGET_CLASSES = {'Object', 'EmptySlot'}
 
 
+def _horizontal_overlap_ratio(target_bbox, label_bbox):
+    """Fraction of the label's width that overlaps horizontally with the target."""
+    overlap_left = max(target_bbox[0], label_bbox[0])
+    overlap_right = min(target_bbox[2], label_bbox[2])
+    overlap = max(0, overlap_right - overlap_left)
+    label_width = label_bbox[2] - label_bbox[0]
+    if label_width <= 0:
+        return 0.0
+    return overlap / label_width
+
+
 def associate_sku_labels(
     detections: sv.Detections,
     img_height: int,
@@ -20,6 +31,7 @@ def associate_sku_labels(
     class_names: Optional[List[str]] = None,
     shelf_gap_ratio: float = 0.08,
     alignment_tolerance_ratio: float = 0.03,
+    right_side_overlap_threshold: float = 0.80,
 ) -> List[dict]:
     """
     Associate Objects and EmptySlots with their SKU labels based on
@@ -37,9 +49,8 @@ def associate_sku_labels(
 
     labels_list = [class_names[cid] for cid in detections.class_id]
 
-    # separate targets and label-like detections
-    targets = []     # (det_idx, bbox, class_name)
-    sku_labels = []  # (det_idx, bbox)
+    targets = []
+    sku_labels = []
 
     for i, (bbox, cls) in enumerate(zip(detections.xyxy, labels_list)):
         if cls in TARGET_CLASSES:
@@ -59,7 +70,7 @@ def associate_sku_labels(
     def right(bbox): return bbox[2]
     def bottom(bbox): return bbox[3]
 
-    # cluster label detections into shelf rows by vertical center
+    # cluster labels into shelf rows
     sorted_labels = sorted(sku_labels, key=lambda s: cy(s[1]))
     shelf_rows = []
 
@@ -77,7 +88,26 @@ def associate_sku_labels(
     for row in shelf_rows:
         row.sort(key=lambda s: left(s[1]))
 
-    # build associations
+    def _is_valid_association(item_bbox, lbl_bbox):
+        """
+        Check association validity:
+        1. Label must be below the target (no upward associations)
+        2. If label is to the right of target center, require >=80% overlap
+        """
+        # label center must be below target center
+        if cy(lbl_bbox) <= cy(item_bbox):
+            return False
+
+        # if label's left edge is to the right of the target's center,
+        # only allow if heavy horizontal overlap
+        item_center_x = cx(item_bbox)
+        if left(lbl_bbox) > item_center_x:
+            overlap = _horizontal_overlap_ratio(item_bbox, lbl_bbox)
+            if overlap < right_side_overlap_threshold:
+                return False
+
+        return True
+
     results = []
 
     for item_idx, item_bbox, item_cls in targets:
@@ -92,6 +122,9 @@ def associate_sku_labels(
 
         for row in shelf_rows:
             row_cy = np.mean([cy(b) for _, b in row])
+            # row must be below target center
+            if row_cy <= cy(item_bbox):
+                continue
             dist = row_cy - item_bottom_y
             if dist < -shelf_gap_tol:
                 continue
@@ -100,8 +133,12 @@ def associate_sku_labels(
                 best_row = row
 
         if best_row is None:
+            # fallback: closest row that is still below target center
+            best_dist = float('inf')
             for row in shelf_rows:
                 row_cy = np.mean([cy(b) for _, b in row])
+                if row_cy <= cy(item_bbox):
+                    continue
                 dist = abs(row_cy - item_bottom_y)
                 if dist < best_dist:
                     best_dist = dist
@@ -112,11 +149,14 @@ def associate_sku_labels(
 
         # EmptySlot spanning multiple labels
         if item_cls == 'EmptySlot':
-            spanning = [
-                (lbl_idx, lbl_bbox) for lbl_idx, lbl_bbox in best_row
-                if right(lbl_bbox) > item_left_x + align_tol
-                and left(lbl_bbox) < item_right_x - align_tol
-            ]
+            spanning = []
+            for lbl_idx, lbl_bbox in best_row:
+                if not _is_valid_association(item_bbox, lbl_bbox):
+                    continue
+                if (right(lbl_bbox) > item_left_x + align_tol
+                        and left(lbl_bbox) < item_right_x - align_tol):
+                    spanning.append((lbl_idx, lbl_bbox))
+
             if spanning:
                 for lbl_idx, lbl_bbox in spanning:
                     results.append({
@@ -133,6 +173,8 @@ def associate_sku_labels(
         best_label_dist = float('inf')
 
         for lbl_idx, lbl_bbox in best_row:
+            if not _is_valid_association(item_bbox, lbl_bbox):
+                continue
             lbl_left = left(lbl_bbox)
             if lbl_left <= item_center_x + align_tol:
                 dist = item_center_x - lbl_left
@@ -141,9 +183,12 @@ def associate_sku_labels(
                     best_label_idx = lbl_idx
                     best_label_bbox = lbl_bbox
 
-        # fallback: closest label overall
+        # fallback: closest valid label overall
         if best_label_idx is None:
+            best_label_dist = float('inf')
             for lbl_idx, lbl_bbox in best_row:
+                if not _is_valid_association(item_bbox, lbl_bbox):
+                    continue
                 dist = abs(left(lbl_bbox) - item_center_x)
                 if dist < best_label_dist:
                     best_label_dist = dist
@@ -159,66 +204,3 @@ def associate_sku_labels(
             })
 
     return results
-
-
-# --- visualization ---
-
-CLASS_COLORS = {
-    'Object':     (0, 255, 0),
-    'EmptySlot':  (0, 0, 255),
-    'SkuLabel':   (255, 165, 0),
-    'Reflection': (255, 165, 0),  # same as SkuLabel visually
-    'OfferLabel': (180, 180, 180),
-}
-
-ASSOC_COLORS = {
-    'Object':    (0, 220, 0),
-    'EmptySlot': (50, 50, 255),
-}
-
-
-def draw_associations(
-    image: np.ndarray,
-    detections: sv.Detections,
-    associations: List[dict],
-    class_names: Optional[List[str]] = None,
-    line_thickness: int = 2,
-    box_thickness: int = 2,
-    font_scale: float = 0.5,
-    dot_radius: int = 5,
-) -> np.ndarray:
-    if class_names is None:
-        class_names = CLASS_NAMES
-
-    vis = image.copy()
-
-    # draw all bounding boxes
-    for i, bbox in enumerate(detections.xyxy):
-        cls_name = class_names[detections.class_id[i]]
-        color = CLASS_COLORS.get(cls_name, (200, 200, 200))
-        x1, y1, x2, y2 = bbox.astype(int)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, box_thickness)
-
-        label = cls_name
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        cv2.rectangle(vis, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(vis, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
-
-    # draw association lines
-    for assoc in associations:
-        t_bbox = assoc['target_xyxy']
-        l_bbox = assoc['label_xyxy']
-
-        t_cx = int((t_bbox[0] + t_bbox[2]) / 2)
-        t_cy = int((t_bbox[1] + t_bbox[3]) / 2)
-        l_cx = int((l_bbox[0] + l_bbox[2]) / 2)
-        l_cy = int((l_bbox[1] + l_bbox[3]) / 2)
-
-        line_color = ASSOC_COLORS.get(assoc['target_type'], (255, 255, 255))
-
-        cv2.circle(vis, (t_cx, t_cy), dot_radius, line_color, -1)
-        cv2.line(vis, (t_cx, t_cy), (l_cx, l_cy), line_color, line_thickness, cv2.LINE_AA)
-        cv2.circle(vis, (l_cx, l_cy), dot_radius, line_color, -1)
-
-    return vis
