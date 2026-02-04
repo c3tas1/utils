@@ -20,6 +20,7 @@ class PaddleOCR:
         det_min_box_size: int = 3,
         rec_batch_size: int = 6,
         rec_image_shape: str = "3,48,320",
+        det_scales: list = None,
     ):
         self.det_db_thresh = det_db_thresh
         self.det_db_box_thresh = det_db_box_thresh
@@ -29,6 +30,7 @@ class PaddleOCR:
         self.det_min_box_size = det_min_box_size
         self.rec_batch_size = rec_batch_size
         self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
+        self.det_scales = det_scales
 
         self.ie = Core()
 
@@ -48,19 +50,18 @@ class PaddleOCR:
                 self.character.append(line.strip("\n"))
         self.character.append(" ")
 
-    def _det_preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, dict]:
+    def _det_preprocess(self, img: np.ndarray, limit_side_len: int = None, limit_type: str = None) -> Tuple[np.ndarray, dict]:
         src_h, src_w = img.shape[:2]
+        limit = limit_side_len or self.det_limit_side_len
+        ltype = limit_type or self.det_limit_type
         ratio = 1.0
 
-        if self.det_limit_type == "min":
-            if min(src_h, src_w) < self.det_limit_side_len:
-                if src_h < src_w:
-                    ratio = self.det_limit_side_len / src_h
-                else:
-                    ratio = self.det_limit_side_len / src_w
+        if ltype == "min":
+            if min(src_h, src_w) < limit:
+                ratio = limit / min(src_h, src_w)
         else:
-            if max(src_h, src_w) > self.det_limit_side_len:
-                ratio = self.det_limit_side_len / max(src_h, src_w)
+            if max(src_h, src_w) > limit:
+                ratio = limit / max(src_h, src_w)
 
         resize_h = max(int(round(int(src_h * ratio) / 32) * 32), 32)
         resize_w = max(int(round(int(src_w * ratio) / 32) * 32), 32)
@@ -135,10 +136,56 @@ class PaddleOCR:
         rect[1], rect[3] = pts[np.argmin(d)], pts[np.argmax(d)]
         return rect
 
-    def _detect(self, img: np.ndarray) -> List[np.ndarray]:
-        tensor, shape = self._det_preprocess(img)
+    def _run_det(self, img: np.ndarray, limit_side_len: int = None, limit_type: str = None) -> List[np.ndarray]:
+        tensor, shape = self._det_preprocess(img, limit_side_len, limit_type)
         pred = self.det_compiled({self.det_input: tensor})[self.det_output]
         return self._det_postprocess(pred, shape)
+
+    def _boxes_overlap(self, a: np.ndarray, b: np.ndarray, threshold: float = 0.5) -> bool:
+        ax1, ay1 = a[:, 0].min(), a[:, 1].min()
+        ax2, ay2 = a[:, 0].max(), a[:, 1].max()
+        bx1, by1 = b[:, 0].min(), b[:, 1].min()
+        bx2, by2 = b[:, 0].max(), b[:, 1].max()
+
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+
+        inter = iw * ih
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        min_area = min(area_a, area_b)
+
+        return (inter / min_area) > threshold if min_area > 0 else False
+
+    def _merge_boxes(self, boxes_a: List[np.ndarray], boxes_b: List[np.ndarray]) -> List[np.ndarray]:
+        if not boxes_a:
+            return boxes_b
+        if not boxes_b:
+            return boxes_a
+
+        merged = list(boxes_a)
+        for b in boxes_b:
+            is_dup = False
+            for a in merged:
+                if self._boxes_overlap(a, b, 0.5):
+                    is_dup = True
+                    break
+            if not is_dup:
+                merged.append(b)
+        return merged
+
+    def _detect(self, img: np.ndarray) -> List[np.ndarray]:
+        boxes = self._run_det(img)
+
+        if self.det_scales:
+            for scale in self.det_scales:
+                if scale == self.det_limit_side_len:
+                    continue
+                extra = self._run_det(img, limit_side_len=scale, limit_type="max")
+                boxes = self._merge_boxes(boxes, extra)
+
+        return boxes
 
     def _rec_preprocess(self, img: np.ndarray, max_wh_ratio: float) -> np.ndarray:
         imgC, imgH, imgW = self.rec_image_shape
