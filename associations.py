@@ -1,17 +1,16 @@
 import supervision as sv
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
 import cv2
 
 
-@dataclass
-class Association:
-    """Represents an association between a product/slot and its SKU label(s)."""
-    detection_idx: int
-    detection_class: str
-    sku_label_idxs: List[int]
-    bbox: np.ndarray
+# class name mapping
+CLASS_NAMES = ['Object', 'EmptySlot', 'SkuLabel', 'OfferLabel', 'Reflection']
+
+# classes that act as labels (SkuLabel + Reflection)
+LABEL_CLASSES = {'SkuLabel', 'Reflection'}
+# classes that are association targets
+TARGET_CLASSES = {'Object', 'EmptySlot'}
 
 
 def associate_sku_labels(
@@ -21,22 +20,34 @@ def associate_sku_labels(
     class_names: Optional[List[str]] = None,
     shelf_gap_ratio: float = 0.08,
     alignment_tolerance_ratio: float = 0.03,
-) -> List[Association]:
+) -> List[dict]:
+    """
+    Associate Objects and EmptySlots with their SKU labels based on
+    NIST shelf-label positioning guidelines.
+
+    Returns:
+        List of dicts with keys:
+            label_idx:   index into original detections for the label
+            label_xyxy:  [x1, y1, x2, y2] bbox of the label
+            target_xyxy: [x1, y1, x2, y2] bbox of the associated object/slot
+            target_type: class name of the target ('Object' or 'EmptySlot')
+    """
     if class_names is None:
-        class_names = ['object', 'empty_slot', 'sku_label']
+        class_names = CLASS_NAMES
 
-    labels = [class_names[cid] for cid in detections.class_id]
+    labels_list = [class_names[cid] for cid in detections.class_id]
 
-    items = []
-    sku_labels = []
+    # separate targets and label-like detections
+    targets = []     # (det_idx, bbox, class_name)
+    sku_labels = []  # (det_idx, bbox)
 
-    for i, (bbox, cls) in enumerate(zip(detections.xyxy, labels)):
-        if cls in ('object', 'empty_slot'):
-            items.append((i, bbox, cls))
-        elif cls == 'sku_label':
+    for i, (bbox, cls) in enumerate(zip(detections.xyxy, labels_list)):
+        if cls in TARGET_CLASSES:
+            targets.append((i, bbox, cls))
+        elif cls in LABEL_CLASSES:
             sku_labels.append((i, bbox))
 
-    if not items or not sku_labels:
+    if not targets or not sku_labels:
         return []
 
     shelf_gap_tol = img_height * shelf_gap_ratio
@@ -48,6 +59,7 @@ def associate_sku_labels(
     def right(bbox): return bbox[2]
     def bottom(bbox): return bbox[3]
 
+    # cluster label detections into shelf rows by vertical center
     sorted_labels = sorted(sku_labels, key=lambda s: cy(s[1]))
     shelf_rows = []
 
@@ -65,14 +77,16 @@ def associate_sku_labels(
     for row in shelf_rows:
         row.sort(key=lambda s: left(s[1]))
 
-    associations = []
+    # build associations
+    results = []
 
-    for item_idx, item_bbox, item_cls in items:
+    for item_idx, item_bbox, item_cls in targets:
         item_bottom_y = bottom(item_bbox)
         item_center_x = cx(item_bbox)
         item_left_x = left(item_bbox)
         item_right_x = right(item_bbox)
 
+        # find the label row just below this target
         best_row = None
         best_dist = float('inf')
 
@@ -96,22 +110,26 @@ def associate_sku_labels(
         if best_row is None:
             continue
 
-        if item_cls == 'empty_slot':
+        # EmptySlot spanning multiple labels
+        if item_cls == 'EmptySlot':
             spanning = [
-                lbl_idx for lbl_idx, lbl_bbox in best_row
+                (lbl_idx, lbl_bbox) for lbl_idx, lbl_bbox in best_row
                 if right(lbl_bbox) > item_left_x + align_tol
                 and left(lbl_bbox) < item_right_x - align_tol
             ]
             if spanning:
-                associations.append(Association(
-                    detection_idx=item_idx,
-                    detection_class=item_cls,
-                    sku_label_idxs=spanning,
-                    bbox=item_bbox,
-                ))
+                for lbl_idx, lbl_bbox in spanning:
+                    results.append({
+                        'label_idx': lbl_idx,
+                        'label_xyxy': lbl_bbox.tolist() if hasattr(lbl_bbox, 'tolist') else list(lbl_bbox),
+                        'target_xyxy': item_bbox.tolist() if hasattr(item_bbox, 'tolist') else list(item_bbox),
+                        'target_type': item_cls,
+                    })
                 continue
 
+        # standard: single label association
         best_label_idx = None
+        best_label_bbox = None
         best_label_dist = float('inf')
 
         for lbl_idx, lbl_bbox in best_row:
@@ -121,91 +139,86 @@ def associate_sku_labels(
                 if dist < best_label_dist:
                     best_label_dist = dist
                     best_label_idx = lbl_idx
+                    best_label_bbox = lbl_bbox
 
+        # fallback: closest label overall
         if best_label_idx is None:
             for lbl_idx, lbl_bbox in best_row:
                 dist = abs(left(lbl_bbox) - item_center_x)
                 if dist < best_label_dist:
                     best_label_dist = dist
                     best_label_idx = lbl_idx
+                    best_label_bbox = lbl_bbox
 
         if best_label_idx is not None:
-            associations.append(Association(
-                detection_idx=item_idx,
-                detection_class=item_cls,
-                sku_label_idxs=[best_label_idx],
-                bbox=item_bbox,
-            ))
+            results.append({
+                'label_idx': best_label_idx,
+                'label_xyxy': best_label_bbox.tolist() if hasattr(best_label_bbox, 'tolist') else list(best_label_bbox),
+                'target_xyxy': item_bbox.tolist() if hasattr(item_bbox, 'tolist') else list(item_bbox),
+                'target_type': item_cls,
+            })
 
-    return associations
+    return results
 
 
-# --- colors per class ---
+# --- visualization ---
+
 CLASS_COLORS = {
-    'object':     (0, 255, 0),    # green
-    'empty_slot': (0, 0, 255),    # red
-    'sku_label':  (255, 165, 0),  # orange
+    'Object':     (0, 255, 0),
+    'EmptySlot':  (0, 0, 255),
+    'SkuLabel':   (255, 165, 0),
+    'Reflection': (255, 165, 0),  # same as SkuLabel visually
+    'OfferLabel': (180, 180, 180),
 }
 
-# association line colors
 ASSOC_COLORS = {
-    'object':     (0, 220, 0),
-    'empty_slot': (50, 50, 255),
+    'Object':    (0, 220, 0),
+    'EmptySlot': (50, 50, 255),
 }
 
 
 def draw_associations(
     image: np.ndarray,
     detections: sv.Detections,
-    associations: List[Association],
+    associations: List[dict],
     class_names: Optional[List[str]] = None,
     line_thickness: int = 2,
     box_thickness: int = 2,
     font_scale: float = 0.5,
     dot_radius: int = 5,
 ) -> np.ndarray:
-    """
-    Draw bounding boxes for all detections and association lines
-    from each object/empty_slot center to its associated sku_label center(s).
-    """
     if class_names is None:
-        class_names = ['object', 'empty_slot', 'sku_label']
+        class_names = CLASS_NAMES
 
     vis = image.copy()
 
-    # --- draw all bounding boxes first ---
+    # draw all bounding boxes
     for i, bbox in enumerate(detections.xyxy):
         cls_name = class_names[detections.class_id[i]]
         color = CLASS_COLORS.get(cls_name, (200, 200, 200))
         x1, y1, x2, y2 = bbox.astype(int)
         cv2.rectangle(vis, (x1, y1), (x2, y2), color, box_thickness)
 
-        label = cls_name.replace('_', ' ')
+        label = cls_name
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
         cv2.rectangle(vis, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
         cv2.putText(vis, label, (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # --- draw association lines ---
+    # draw association lines
     for assoc in associations:
-        item_bbox = detections.xyxy[assoc.detection_idx]
-        item_cx = int((item_bbox[0] + item_bbox[2]) / 2)
-        item_cy = int((item_bbox[1] + item_bbox[3]) / 2)
-        line_color = ASSOC_COLORS.get(assoc.detection_class, (255, 255, 255))
+        t_bbox = assoc['target_xyxy']
+        l_bbox = assoc['label_xyxy']
 
-        # dot at item center
-        cv2.circle(vis, (item_cx, item_cy), dot_radius, line_color, -1)
+        t_cx = int((t_bbox[0] + t_bbox[2]) / 2)
+        t_cy = int((t_bbox[1] + t_bbox[3]) / 2)
+        l_cx = int((l_bbox[0] + l_bbox[2]) / 2)
+        l_cy = int((l_bbox[1] + l_bbox[3]) / 2)
 
-        for lbl_idx in assoc.sku_label_idxs:
-            lbl_bbox = detections.xyxy[lbl_idx]
-            lbl_cx = int((lbl_bbox[0] + lbl_bbox[2]) / 2)
-            lbl_cy = int((lbl_bbox[1] + lbl_bbox[3]) / 2)
+        line_color = ASSOC_COLORS.get(assoc['target_type'], (255, 255, 255))
 
-            # line from item center to label center
-            cv2.line(vis, (item_cx, item_cy), (lbl_cx, lbl_cy),
-                     line_color, line_thickness, cv2.LINE_AA)
-
-            # dot at label center
-            cv2.circle(vis, (lbl_cx, lbl_cy), dot_radius, line_color, -1)
+        cv2.circle(vis, (t_cx, t_cy), dot_radius, line_color, -1)
+        cv2.line(vis, (t_cx, t_cy), (l_cx, l_cy), line_color, line_thickness, cv2.LINE_AA)
+        cv2.circle(vis, (l_cx, l_cy), dot_radius, line_color, -1)
 
     return vis
