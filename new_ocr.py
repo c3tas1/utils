@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Any, Optional, Union
 from openvino.runtime import Core
 import math
+import os
 
 
 class PaddleOCR:
@@ -13,8 +14,8 @@ class PaddleOCR:
         char_dict_path: str,
         device: str = "CPU",
         det_db_thresh: float = 0.2,
-        det_db_box_thresh: float = 0.4,
-        det_db_unclip_ratio: float = 1.8,
+        det_db_box_thresh: float = 0.3,
+        det_db_unclip_ratio: float = 2.0,
         det_limit_side_len: int = 960,
         det_limit_type: str = "max",
         det_min_box_size: int = 3,
@@ -23,7 +24,7 @@ class PaddleOCR:
         rec_image_shape: str = "3,48,320",
         preprocess: bool = True,
         upscale_small: bool = True,
-        min_image_size: int = 800,
+        min_image_size: int = 1000,
     ):
         self.det_db_thresh = det_db_thresh
         self.det_db_box_thresh = det_db_box_thresh
@@ -31,7 +32,7 @@ class PaddleOCR:
         self.det_limit_side_len = det_limit_side_len
         self.det_limit_type = det_limit_type
         self.det_min_box_size = det_min_box_size
-        self.det_scales = det_scales if det_scales else [120, 480, 960]
+        self.det_scales = det_scales if det_scales else [120, 320, 640, 960]
         self.rec_batch_size = rec_batch_size
         self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
         self.preprocess = preprocess
@@ -57,10 +58,10 @@ class PaddleOCR:
         self.character.append(" ")
 
     def _enhance_image(self, img: np.ndarray) -> np.ndarray:
-        denoised = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
-        kernel = np.array([[-1, -1, -1],
-                          [-1,  9, -1],
-                          [-1, -1, -1]])
+        denoised = cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
+        kernel = np.array([[0, -1, 0],
+                          [-1,  5, -1],
+                          [0, -1, 0]])
         sharpened = cv2.filter2D(denoised, -1, kernel)
         lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
@@ -262,12 +263,12 @@ class PaddleOCR:
 
         return results
 
-    def _crop_text(self, img: np.ndarray, pts: np.ndarray) -> Optional[np.ndarray]:
+    def _crop_text(self, img: np.ndarray, pts: np.ndarray, padding: int = 5) -> Optional[np.ndarray]:
         h, w = img.shape[:2]
         pts = pts.astype(np.float32).reshape(4, 2)
 
-        left, right = max(0, int(pts[:, 0].min()) - 3), min(w, int(pts[:, 0].max()) + 3)
-        top, bottom = max(0, int(pts[:, 1].min()) - 3), min(h, int(pts[:, 1].max()) + 3)
+        left, right = max(0, int(pts[:, 0].min()) - padding), min(w, int(pts[:, 0].max()) + padding)
+        top, bottom = max(0, int(pts[:, 1].min()) - padding), min(h, int(pts[:, 1].max()) + padding)
 
         crop = img[top:bottom, left:right, :].copy()
         pts_shifted = pts - np.array([left, top], dtype=np.float32)
@@ -277,8 +278,12 @@ class PaddleOCR:
         if cw < 1 or ch < 1:
             return None
 
+        cw += padding * 2
+        ch += padding * 2
+
         src = pts_shifted.reshape(4, 2).astype(np.float32)
-        dst = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float32)
+        dst = np.array([[padding, padding], [cw - padding, padding], 
+                       [cw - padding, ch - padding], [padding, ch - padding]], dtype=np.float32)
         M = cv2.getPerspectiveTransform(src, dst)
         out = cv2.warpPerspective(crop, M, (cw, ch), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
 
@@ -296,7 +301,7 @@ class PaddleOCR:
                     break
         return boxes
 
-    def predict(self, img: Union[str, np.ndarray]) -> List[Dict[str, Any]]:
+    def predict(self, img: Union[str, np.ndarray], save_debug: str = None) -> List[Dict[str, Any]]:
         if isinstance(img, str):
             image = cv2.imread(img)
             if image is None:
@@ -304,14 +309,20 @@ class PaddleOCR:
         else:
             image = img.copy()
 
+        original = image.copy()
+
         if self.upscale_small:
             image = self._upscale_image(image)
 
         if self.preprocess:
             image = self._enhance_image(image)
 
+        processed = image.copy()
+
         boxes = self._sort_boxes(self._detect(image))
         if not boxes:
+            if save_debug:
+                self._save_debug_image(original, processed, [], [], save_debug)
             return []
 
         crops, valid = [], []
@@ -322,23 +333,113 @@ class PaddleOCR:
                 valid.append(box)
 
         if not crops:
+            if save_debug:
+                self._save_debug_image(original, processed, boxes, [], save_debug)
             return []
 
         rec_results = self._recognize(crops)
-        return [
-            {'text_region': valid[i].tolist(), 'text': text, 'confidence': conf}
+
+        results = [
+            {'text_region': valid[i].tolist(), 'text': text, 'confidence': conf, 'crop': crops[i]}
             for i, (text, conf) in enumerate(rec_results)
         ]
 
-    def __call__(self, img: Union[str, np.ndarray]) -> List[Dict[str, Any]]:
-        return self.predict(img)
+        if save_debug:
+            self._save_debug_image(original, processed, valid, results, save_debug)
+
+        for r in results:
+            del r['crop']
+
+        return results
+
+    def _save_debug_image(self, original: np.ndarray, processed: np.ndarray, 
+                          boxes: List[np.ndarray], results: List[Dict], save_path: str):
+        oh, ow = original.shape[:2]
+        ph, pw = processed.shape[:2]
+
+        scale = oh / ph if ph > oh else 1.0
+        if scale != 1.0:
+            processed = cv2.resize(processed, (ow, oh))
+
+        left_img = original.copy()
+        right_img = processed.copy()
+
+        colors = [
+            (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0)
+        ]
+
+        for i, box in enumerate(boxes):
+            color = colors[i % len(colors)]
+            if scale != 1.0:
+                box_scaled = (box * scale).astype(np.int32)
+            else:
+                box_orig = box.copy()
+                box_orig[:, 0] = box[:, 0] * (ow / pw)
+                box_orig[:, 1] = box[:, 1] * (oh / ph)
+                box_scaled = box_orig.astype(np.int32)
+
+            cv2.polylines(left_img, [box_scaled], True, color, 2)
+            cv2.polylines(right_img, [box.astype(np.int32)], True, color, 2)
+
+            if i < len(results):
+                text = results[i]['text']
+                conf = results[i]['confidence']
+                label = f"{i}: {text} ({conf:.2f})"
+                
+                x, y = int(box_scaled[0][0]), int(box_scaled[0][1]) - 5
+                cv2.putText(left_img, label, (x, max(y, 15)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        combined = np.hstack([left_img, right_img])
+
+        if results:
+            crop_height = 60
+            num_crops = len(results)
+            crops_per_row = max(1, combined.shape[1] // 200)
+            num_rows = (num_crops + crops_per_row - 1) // crops_per_row
+            crop_panel_height = num_rows * (crop_height + 40)
+            crop_panel = np.ones((crop_panel_height, combined.shape[1], 3), dtype=np.uint8) * 255
+
+            x_offset = 10
+            y_offset = 10
+            max_crop_width = 180
+
+            for i, res in enumerate(results):
+                crop = res['crop']
+                ch, cw = crop.shape[:2]
+
+                ratio = min(crop_height / ch, max_crop_width / cw)
+                new_w, new_h = int(cw * ratio), int(ch * ratio)
+                resized_crop = cv2.resize(crop, (new_w, new_h))
+
+                if x_offset + new_w + 10 > combined.shape[1]:
+                    x_offset = 10
+                    y_offset += crop_height + 40
+
+                if y_offset + new_h < crop_panel_height:
+                    crop_panel[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized_crop
+
+                    text = res['text'] if len(res['text']) <= 20 else res['text'][:17] + "..."
+                    label = f"{i}: {text}"
+                    cv2.putText(crop_panel, label, (x_offset, y_offset + new_h + 15),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+
+                x_offset += new_w + 20
+
+            combined = np.vstack([combined, crop_panel])
+
+        cv2.imwrite(save_path, combined)
+
+    def __call__(self, img: Union[str, np.ndarray], save_debug: str = None) -> List[Dict[str, Any]]:
+        return self.predict(img, save_debug)
 
 
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 5:
-        print("Usage: python paddleocr_openvino.py <det_model.xml> <rec_model.xml> <char_dict.txt> <image_path>")
+        print("Usage: python paddleocr_openvino.py <det_model.xml> <rec_model.xml> <char_dict.txt> <image_path> [output_debug.jpg]")
         sys.exit(0)
 
     ocr = PaddleOCR(
@@ -347,7 +448,12 @@ if __name__ == "__main__":
         char_dict_path=sys.argv[3],
     )
 
-    result = ocr.predict(sys.argv[4])
+    debug_path = sys.argv[5] if len(sys.argv) > 5 else "debug_output.jpg"
+    result = ocr.predict(sys.argv[4], save_debug=debug_path)
 
-    for r in result:
-        print(f"{r['text']} ({r['confidence']:.2f})")
+    print(f"\nDetected {len(result)} text regions:")
+    print("-" * 50)
+    for i, r in enumerate(result):
+        print(f"{i}: '{r['text']}' (conf: {r['confidence']:.2f})")
+    print("-" * 50)
+    print(f"Debug image saved to: {debug_path}")
