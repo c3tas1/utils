@@ -9,13 +9,13 @@ import os
 class PaddleOCR:
     def __init__(
         self,
-        det_model_path: str,
-        rec_model_path: str,
-        char_dict_path: str,
+        det_model_path: str = None,
+        rec_model_path: str = None,
+        char_dict_path: str = None,
         device: str = "CPU",
-        det_db_thresh: float = 0.2,
-        det_db_box_thresh: float = 0.3,
-        det_db_unclip_ratio: float = 2.0,
+        det_db_thresh: float = 0.15,
+        det_db_box_thresh: float = 0.2,
+        det_db_unclip_ratio: float = 2.5,
         det_limit_side_len: int = 960,
         det_limit_type: str = "max",
         det_min_box_size: int = 3,
@@ -24,7 +24,9 @@ class PaddleOCR:
         rec_image_shape: str = "3,48,320",
         preprocess: bool = True,
         upscale_small: bool = True,
-        min_image_size: int = 1000,
+        min_image_size: int = 1200,
+        use_craft: bool = False,
+        craft_model_path: str = None,
     ):
         self.det_db_thresh = det_db_thresh
         self.det_db_box_thresh = det_db_box_thresh
@@ -32,30 +34,54 @@ class PaddleOCR:
         self.det_limit_side_len = det_limit_side_len
         self.det_limit_type = det_limit_type
         self.det_min_box_size = det_min_box_size
-        self.det_scales = det_scales if det_scales else [120, 320, 640, 960]
+        self.det_scales = det_scales if det_scales else [80, 160, 320, 640, 960]
         self.rec_batch_size = rec_batch_size
         self.rec_image_shape = [int(x) for x in rec_image_shape.split(",")]
         self.preprocess = preprocess
         self.upscale_small = upscale_small
         self.min_image_size = min_image_size
+        self.use_craft = use_craft
 
         self.ie = Core()
 
-        det_model = self.ie.read_model(det_model_path)
-        self.det_compiled = self.ie.compile_model(det_model, device)
-        self.det_input = self.det_compiled.input(0)
-        self.det_output = self.det_compiled.output(0)
+        if det_model_path and not use_craft:
+            det_model = self.ie.read_model(det_model_path)
+            self.det_compiled = self.ie.compile_model(det_model, device)
+            self.det_input = self.det_compiled.input(0)
+            self.det_output = self.det_compiled.output(0)
+        else:
+            self.det_compiled = None
 
-        rec_model = self.ie.read_model(rec_model_path)
-        self.rec_compiled = self.ie.compile_model(rec_model, device)
-        self.rec_input = self.rec_compiled.input(0)
-        self.rec_output = self.rec_compiled.output(0)
+        if use_craft:
+            self._init_craft(craft_model_path, device)
+
+        if rec_model_path:
+            rec_model = self.ie.read_model(rec_model_path)
+            self.rec_compiled = self.ie.compile_model(rec_model, device)
+            self.rec_input = self.rec_compiled.input(0)
+            self.rec_output = self.rec_compiled.output(0)
 
         self.character = ["blank"]
-        with open(char_dict_path, "r", encoding="utf-8") as f:
-            for line in f:
-                self.character.append(line.strip("\n"))
-        self.character.append(" ")
+        if char_dict_path:
+            with open(char_dict_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    self.character.append(line.strip("\n"))
+            self.character.append(" ")
+
+    def _init_craft(self, model_path: str, device: str):
+        if model_path:
+            craft_model = self.ie.read_model(model_path)
+            self.craft_compiled = self.ie.compile_model(craft_model, device)
+            self.craft_input = self.craft_compiled.input(0)
+            self.craft_output_y = self.craft_compiled.output(0)
+        else:
+            self.craft_compiled = None
+            try:
+                import craft_text_detector
+                self.craft_detector = craft_text_detector
+            except ImportError:
+                print("CRAFT not available. Install with: pip install craft-text-detector")
+                self.craft_detector = None
 
     def _enhance_image(self, img: np.ndarray) -> np.ndarray:
         denoised = cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
@@ -106,6 +132,10 @@ class PaddleOCR:
     def _det_postprocess(self, pred: np.ndarray, shape: dict) -> List[np.ndarray]:
         pred = pred[0, 0]
         mask = ((pred > self.det_db_thresh) * 255).astype(np.uint8)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        
         contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         boxes = []
@@ -169,6 +199,28 @@ class PaddleOCR:
         pred = self.det_compiled({self.det_input: tensor})[self.det_output]
         return self._det_postprocess(pred, shape)
 
+    def _detect_craft(self, img: np.ndarray) -> List[np.ndarray]:
+        if hasattr(self, 'craft_detector') and self.craft_detector:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                cv2.imwrite(f.name, img)
+                prediction_result = self.craft_detector.detect_text(
+                    f.name,
+                    text_threshold=0.7,
+                    link_threshold=0.4,
+                    low_text=0.4,
+                    cuda=False,
+                    poly=False
+                )
+                os.unlink(f.name)
+            
+            boxes = []
+            for box in prediction_result['boxes']:
+                box = np.array(box).reshape(4, 2).astype(np.float32)
+                boxes.append(box)
+            return boxes
+        return []
+
     def _boxes_overlap(self, a: np.ndarray, b: np.ndarray, threshold: float = 0.5) -> bool:
         ax1, ay1 = a[:, 0].min(), a[:, 1].min()
         ax2, ay2 = a[:, 0].max(), a[:, 1].max()
@@ -204,6 +256,9 @@ class PaddleOCR:
         return merged
 
     def _detect(self, img: np.ndarray) -> List[np.ndarray]:
+        if self.use_craft:
+            return self._detect_craft(img)
+
         boxes = self._run_det(img)
 
         if self.det_scales:
@@ -263,7 +318,7 @@ class PaddleOCR:
 
         return results
 
-    def _crop_text(self, img: np.ndarray, pts: np.ndarray, padding: int = 5) -> Optional[np.ndarray]:
+    def _crop_text(self, img: np.ndarray, pts: np.ndarray, padding: int = 8) -> Optional[np.ndarray]:
         h, w = img.shape[:2]
         pts = pts.astype(np.float32).reshape(4, 2)
 
@@ -282,7 +337,7 @@ class PaddleOCR:
         ch += padding * 2
 
         src = pts_shifted.reshape(4, 2).astype(np.float32)
-        dst = np.array([[padding, padding], [cw - padding, padding], 
+        dst = np.array([[padding, padding], [cw - padding, padding],
                        [cw - padding, ch - padding], [padding, ch - padding]], dtype=np.float32)
         M = cv2.getPerspectiveTransform(src, dst)
         out = cv2.warpPerspective(crop, M, (cw, ch), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
@@ -352,17 +407,16 @@ class PaddleOCR:
 
         return results
 
-    def _save_debug_image(self, original: np.ndarray, processed: np.ndarray, 
+    def _save_debug_image(self, original: np.ndarray, processed: np.ndarray,
                           boxes: List[np.ndarray], results: List[Dict], save_path: str):
         oh, ow = original.shape[:2]
         ph, pw = processed.shape[:2]
 
-        scale = oh / ph if ph > oh else 1.0
-        if scale != 1.0:
-            processed = cv2.resize(processed, (ow, oh))
+        scale_w = ow / pw
+        scale_h = oh / ph
 
         left_img = original.copy()
-        right_img = processed.copy()
+        right_img = cv2.resize(processed, (ow, oh))
 
         colors = [
             (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
@@ -371,24 +425,21 @@ class PaddleOCR:
 
         for i, box in enumerate(boxes):
             color = colors[i % len(colors)]
-            if scale != 1.0:
-                box_scaled = (box * scale).astype(np.int32)
-            else:
-                box_orig = box.copy()
-                box_orig[:, 0] = box[:, 0] * (ow / pw)
-                box_orig[:, 1] = box[:, 1] * (oh / ph)
-                box_scaled = box_orig.astype(np.int32)
+            box_orig = box.copy()
+            box_orig[:, 0] = box[:, 0] * scale_w
+            box_orig[:, 1] = box[:, 1] * scale_h
+            box_scaled = box_orig.astype(np.int32)
 
             cv2.polylines(left_img, [box_scaled], True, color, 2)
-            cv2.polylines(right_img, [box.astype(np.int32)], True, color, 2)
+            cv2.polylines(right_img, [box_scaled], True, color, 2)
 
             if i < len(results):
                 text = results[i]['text']
                 conf = results[i]['confidence']
                 label = f"{i}: {text} ({conf:.2f})"
-                
+
                 x, y = int(box_scaled[0][0]), int(box_scaled[0][1]) - 5
-                cv2.putText(left_img, label, (x, max(y, 15)), 
+                cv2.putText(left_img, label, (x, max(y, 15)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         combined = np.hstack([left_img, right_img])
@@ -440,6 +491,9 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 5:
         print("Usage: python paddleocr_openvino.py <det_model.xml> <rec_model.xml> <char_dict.txt> <image_path> [output_debug.jpg]")
+        print("\nFor CRAFT detection:")
+        print("  pip install craft-text-detector")
+        print("  Then use: use_craft=True in constructor")
         sys.exit(0)
 
     ocr = PaddleOCR(
