@@ -1,68 +1,72 @@
-def reconstruct_shelf_final(all_detections, padded_grid, row_capacities):
+def reconstruct_with_spatial_sync(all_detections, padded_grid, row_capacities):
     """
-    all_detections: List of dicts [{'row': i, 'slot': j, 'sku': '123'}]
-    padded_grid: The full 2D list (List 1) with '00000' and 'sectionbreak'
-    row_capacities: Dict {yolo_row_idx: box_count} (e.g., {0: 4, 1: 3, 2: 4})
+    padded_grid: The raw list_1 with '00000' and 'sectionbreak'
+    all_detections: Detected SKUs with (row, slot, sku)
+    row_capacities: Total YOLO boxes per row
     """
+    # 1. Map detections for easy access
     detection_map = {(d['row'], d['slot']): d['sku'] for d in all_detections}
     
-    # 1. Global Anchor Search
-    # We find where a detected SKU sits in the WHOLE planogram to lock coordinates
+    # 2. Global Anchor Search
+    # We find the first detection that exists ANYWHERE in the planogram grid
     global_row_offset = None
     global_col_offset = None
-
+    
     for det in all_detections:
-        det_row, det_slot, sku = det['row'], det['slot'], det['sku']
+        sku = det['sku']
+        found = False
         
-        found_in_planogram = False
-        # Search every row and column of the planogram grid
+        # Search every row in the planogram, not just the detected row index
         for p_row_idx, p_row in enumerate(padded_grid):
             if sku in p_row:
                 p_col_idx = p_row.index(sku)
-                
-                # Calculate offsets: "How many rows/cols is the camera shifted from index 0,0?"
-                global_row_offset = p_row_idx - det_row
-                global_col_offset = p_col_idx - det_slot
-                found_in_planogram = True
+                # Offset: Mapping YOLO (0,0) to Planogram (p_row, p_col)
+                global_row_offset = p_row_idx - det['row']
+                global_col_offset = p_col_idx - det['slot']
+                found = True
                 break
         
-        if found_in_planogram:
-            break
-        else:
-            # REQ: If detected SKU is not in the planogram grid at all, raise error
-            raise ValueError(f"Detection Error: SKU '{sku}' not found in the planogram grid.")
-
+        if found:
+            break # Anchor established, move to reconstruction
+            
+    # If no valid anchor is found in the whole grid, we can't align
     if global_row_offset is None:
-        raise ValueError("Mapping Error: No valid anchors could be established.")
+        return []
 
-    # 2. Reconstruction using the Spatial Offsets
+    # 3. Reconstruction
     reconstructed_shelf = []
-    
-    # We iterate based on the number of rows the YOLO model actually saw
+    # Iterate through the rows the camera actually saw
     for i in sorted(row_capacities.keys()):
         num_slots = row_capacities[i]
         current_row_output = []
         
-        # Map the current camera row to the correct planogram row
+        # Calculate which planogram row corresponds to this camera row
         target_p_row_idx = i + global_row_offset
         
         for j in range(num_slots):
-            # Check for OCR hits on this specific shelf/slot first
-            if (i, j) in detection_map:
-                current_row_output.append(detection_map[(i, j)])
+            sku_at_slot = detection_map.get((i, j))
+            
+            # Validation: Only trust OCR if it matches the planogram at this row
+            is_valid_ocr = False
+            if 0 <= target_p_row_idx < len(padded_grid):
+                if sku_at_slot and sku_at_slot in padded_grid[target_p_row_idx]:
+                    is_valid_ocr = True
+
+            if is_valid_ocr:
+                current_row_output.append(sku_at_slot)
             else:
-                # Apply the global spatial shift to the padded planogram
-                target_p_col_idx = global_col_offset + j
+                # Apply the global spatial shift to the padded grid
+                target_padded_idx = global_col_offset + j
                 
                 if 0 <= target_p_row_idx < len(padded_grid):
                     p_row = padded_grid[target_p_row_idx]
                     
-                    if 0 <= target_p_col_idx < len(p_row):
-                        val = p_row[target_p_col_idx]
+                    if 0 <= target_padded_idx < len(p_row):
+                        val = p_row[target_padded_idx]
                         
-                        # Logic to skip padding/breaks to find the next valid SKU
+                        # Dilation logic: skip "00000" or "sectionbreak" to find the real SKU
                         if val in ("00000", "sectionbreak"):
-                            search_idx = target_p_col_idx
+                            search_idx = target_padded_idx
                             while (search_idx < len(p_row) and 
                                    p_row[search_idx] in ("00000", "sectionbreak")):
                                 search_idx += 1
@@ -74,9 +78,9 @@ def reconstruct_shelf_final(all_detections, padded_grid, row_capacities):
                         else:
                             current_row_output.append(val)
                     else:
-                        current_row_output.append("COL_OUT_OF_BOUNDS")
+                        current_row_output.append("OOB")
                 else:
-                    current_row_output.append("ROW_OUT_OF_BOUNDS")
+                    current_row_output.append("OOB")
                     
         reconstructed_shelf.append(current_row_output)
         
