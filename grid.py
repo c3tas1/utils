@@ -1,48 +1,44 @@
-def get_top_vertical_matches(target_row_idx, list1, list2, top_n=3):
-    # 1. Identify all boxes in the row we want to fill
-    target_row_boxes = list2[target_row_idx]
+def get_center(bbox):
+    # Returns [x_center, y_center]
+    return [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+
+def find_top_3_near_row2(list1, list2, target_row=2):
+    all_matches = []
     
-    # 2. Collect all valid candidates from other rows that HAVE labels
-    candidates = []
-    for r_idx, row_boxes in enumerate(list2):
-        if r_idx == target_row_idx or not list1[r_idx]:
-            continue
-        for b_idx, box in enumerate(row_boxes):
-            if b_idx < len(list1[r_idx]): # Ensure there is a corresponding label
-                candidates.append({
-                    'coords': box,
-                    'row': r_idx,
-                    'col': b_idx,
-                    'val': list1[r_idx][b_idx]
+    # 1. These are the boxes we are trying to find neighbors FOR
+    empty_row_boxes = list2[target_row]
+    
+    # 2. Loop through every box in the empty row (the "Green Circle" ones)
+    for empty_box_idx, e_box in enumerate(empty_row_boxes):
+        e_center = get_center(e_box)
+        
+        # 3. Loop through every other row in the dataset
+        for r_idx, row_boxes in enumerate(list2):
+            # We only check rows that ARE NOT the empty one AND have values in list1
+            if r_idx == target_row or len(list1[r_idx]) == 0:
+                continue
+            
+            # 4. Loop through every box in these valid rows
+            for c_idx, v_box in enumerate(row_boxes):
+                v_center = get_center(v_box)
+                
+                # Calculate Horizontal (dx) and Vertical (dy) distance
+                dx = abs(e_center[0] - v_center[0])
+                dy = abs(e_center[1] - v_center[1])
+                
+                # We give Horizontal distance a heavy weight (20) 
+                # so the nearest "Vertical" box wins even if it's further away than a side box
+                score = math.sqrt((dx * 20)**2 + dy**2)
+                
+                all_matches.append({
+                    'target_box_in_row2': empty_box_idx,
+                    'match_location': (r_idx, c_idx),
+                    'value': list1[r_idx][c_idx] if c_idx < len(list1[r_idx]) else "N/A",
+                    'score': score
                 })
 
-    all_potential_matches = []
-
-    # 3. For every box in our target row, find how well it matches candidates
-    for t_idx, t_box in enumerate(target_row_boxes):
-        t_x = (t_box[0] + t_box[2]) / 2
-        t_y = (t_box[1] + t_box[3]) / 2
-
-        for cand in candidates:
-            c_box = cand['coords']
-            c_x = (c_box[0] + c_box[2]) / 2
-            c_y = (c_box[1] + c_box[3]) / 2
-
-            dx = abs(t_x - c_x)
-            dy = abs(t_y - c_y)
-
-            # Scoring: Vertical distance + Heavy Horizontal Penalty
-            # This ensures we favor boxes in the same column
-            score = math.sqrt((dx * 25)**2 + dy**2)
-
-            all_potential_matches.append({
-                'target_box_idx': t_idx,
-                'matched_val': cand['val'],
-                'matched_row': cand['row'],
-                'matched_col': cand['col'],
-                'score': score
-            })
-
-    # 4. Sort by best score and return top N
-    all_potential_matches.sort(key=lambda x: x['score'])
-    return all_potential_matches[:top_n]
+    # Sort all findings by the best (lowest) score
+    all_matches.sort(key=lambda x: x['score'])
+    
+    # Return just the top 3
+    return all_matches[:3]
