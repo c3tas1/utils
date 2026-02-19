@@ -1,67 +1,82 @@
-def reconstruct_with_verified_anchors(all_detections, padded_grid, row_capacities):
-    """
-    all_detections: Detected SKUs with (row, slot, sku)
-    padded_grid: The raw list_1 with '00000' and 'sectionbreak'
-    row_capacities: Total YOLO boxes per row
-    """
-    detection_map = {(d['row'], d['slot']): d['sku'] for d in all_detections}
+def reconstruct_verified_shelf(all_detections, padded_grid, row_capacities):
+    # 1. Clean the Detections and find valid anchors
+    # We use a list to store all possible valid offsets found in the image
+    valid_offsets = []
     
-    # 1. ANCHOR SEARCH & VALIDATION
-    local_to_padded_offset = None
-    
-    # Sort detections to prioritize rows with more hits for better anchor stability
     for d in all_detections:
-        row_idx, local_slot, sku = d['row'], d['slot'], d['sku']
+        row_idx = d['row']
+        local_slot = d['slot']
+        # Clean the string to ensure no whitespace/casing issues
+        detected_sku = str(d['sku']).strip().upper()
         
-        # VALIDATION GATE: Only use this as an anchor if it exists in the planogram row
-        if sku in padded_grid[row_idx]:
-            padded_idx = padded_grid[row_idx].index(sku)
-            local_to_padded_offset = padded_idx - local_slot
-            break # Found a verified anchor, we can stop searching
-        else:
-            # Optional: Log the misdetection for model retraining
-            print(f"Ignoring invalid detection: {sku} at row {row_idx}")
+        if row_idx >= len(padded_grid):
+            continue
+            
+        # Get the target planogram row
+        p_row = [str(x).strip().upper() for x in padded_grid[row_idx]]
+        
+        # Check if detected SKU exists in this row
+        if detected_sku in p_row:
+            # Find ALL occurrences (in case of multiples)
+            indices = [i for i, x in enumerate(p_row) if x == detected_sku]
+            for p_idx in indices:
+                # Calculate the offset for this specific match
+                offset = p_idx - local_slot
+                valid_offsets.append(offset)
 
-    # 2. FAIL-SAFE: If no detections match the planogram at all
-    if local_to_padded_offset is None:
-        return "ERROR: No valid anchors found. All OCR results mismatch planogram."
+    if not valid_offsets:
+        return "ERROR: No valid anchors found in the planogram."
+
+    # 2. Use the "Consensus" Offset (The most frequent one)
+    # This prevents one bad OCR/Duplicate SKU from ruining the alignment
+    from collections import Counter
+    global_offset = Counter(valid_offsets).most_common(1)[0][0]
 
     # 3. RECONSTRUCTION
     reconstructed_shelf = []
-    for i in range(len(padded_grid)):
+    
+    for i, full_padded_row in enumerate(padded_grid):
         num_slots = row_capacities.get(i, 0)
-        current_row_output = []
+        row_output = []
         
+        # Mapping detections for THIS row only
+        row_dets = {d['slot']: str(d['sku']).strip().upper() for d in all_detections if d['row'] == i}
+        
+        # Clean the planogram row for this iteration
+        clean_p_row = [str(x).strip().upper() for x in full_padded_row]
+
         for j in range(num_slots):
-            # Check if this specific slot has a detection
-            raw_sku = detection_map.get((i, j))
+            # Calculate where this YOLO slot maps to in the Padded Planogram
+            target_p_idx = global_offset + j
             
-            # Even for the slot itself, we validate: 
-            # If the detected SKU isn't in the planogram, we ignore it and use the planogram instead
-            if raw_sku and raw_sku in padded_grid[i]:
-                current_row_output.append(raw_sku)
+            # Use the OCR result ONLY if it matches the planogram at that specific coordinate
+            # This is the 'Verification Gate'
+            detected_at_slot = row_dets.get(j)
+            
+            if (0 <= target_p_idx < len(clean_p_row) and 
+                detected_at_slot == clean_p_row[target_p_idx]):
+                row_output.append(detected_at_slot)
             else:
-                # Use the verified spatial offset
-                target_padded_idx = local_to_padded_offset + j
-                
-                if 0 <= target_padded_idx < len(padded_grid[i]):
-                    val = padded_grid[i][target_padded_idx]
+                # Fill from Planogram Truth
+                if 0 <= target_p_idx < len(clean_p_row):
+                    val = clean_p_row[target_p_idx]
                     
-                    # Jump padding/breaks to find the nearest real SKU
-                    if val in ("00000", "sectionbreak"):
-                        search_idx = target_padded_idx
-                        while search_idx < len(padded_grid[i]) and padded_grid[i][search_idx] in ("00000", "sectionbreak"):
+                    # Logic to skip 00000/sectionbreak to find the actual SKU
+                    if val in ("00000", "SECTIONBREAK", ""):
+                        search_idx = target_p_idx
+                        while (search_idx < len(clean_p_row) and 
+                               clean_p_row[search_idx] in ("00000", "SECTIONBREAK", "")):
                             search_idx += 1
                         
-                        if search_idx < len(padded_grid[i]):
-                            current_row_output.append(padded_grid[i][search_idx])
+                        if search_idx < len(clean_p_row):
+                            row_output.append(clean_p_row[search_idx])
                         else:
-                            current_row_output.append("EMPTY")
+                            row_output.append("EMPTY")
                     else:
-                        current_row_output.append(val)
+                        row_output.append(val)
                 else:
-                    current_row_output.append("OUT_OF_BOUNDS")
+                    row_output.append("OOB")
                     
-        reconstructed_shelf.append(current_row_output)
+        reconstructed_shelf.append(row_output)
         
     return reconstructed_shelf
