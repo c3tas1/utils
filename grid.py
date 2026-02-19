@@ -1,69 +1,79 @@
-def reconstruct_shelf_grid(all_detections, planogram_grid, row_capacities):
+def reconstruct_from_global_anchor(all_detections, planogram_grid, row_capacities):
     """
-    all_detections: [{'row': i, 'slot': j, 'sku': '123'}]
-    planogram_grid: The raw nested list with '00000' and 'sectionbreak'
-    row_capacities: {row_idx: total_yolo_boxes_seen}
+    planogram_grid: The full 2D padded grid (List 1)
+    all_detections: Detected SKUs with relative (row, slot) from YOLO/OCR
+    row_capacities: The count of YOLO boxes seen on each physical shelf
     """
     
-    # 1. Find the FIRST valid anchor to establish the global spatial shift
-    # We need to know: Slot 'j' in YOLO corresponds to Padded Index 'k' in Planogram
-    global_shift = None
+    global_row_offset = None
+    global_col_offset = None
     
+    # 1. GLOBAL SEARCH: Find where a detected SKU exists ANYWHERE in the planogram
     for det in all_detections:
-        r_idx, local_slot, sku = det['row'], det['slot'], det['sku']
+        detected_row, detected_slot, sku = det['row'], det['slot'], det['sku']
         
-        # Validation: Is this SKU actually in the planogram row?
-        if sku in planogram_grid[r_idx]:
-            # Find the physical index in the padded grid
-            padded_index = planogram_grid[r_idx].index(sku)
-            # Calculation: If Slot 1 is Padded Index 10, the window starts at Padded Index 9
-            global_shift = padded_index - local_slot
-            break
-        else:
-            # If the user's detected SKU isn't in the planogram, it's a hard fail/ignore
-            raise ValueError(f"Detection Error: SKU '{sku}' not found in planogram row {r_idx}")
+        found = False
+        for p_row_idx, p_row in enumerate(planogram_grid):
+            if sku in p_row:
+                p_col_idx = p_row.index(sku)
+                
+                # Calculate the global anchor point
+                # This tells us: YOLO Row 0 is actually Planogram Row X
+                # and YOLO Slot 0 is actually Padded Index Y
+                global_row_offset = p_row_idx - detected_row
+                global_col_offset = p_col_idx - detected_slot
+                found = True
+                break
+        
+        if found: break
+    
+    if global_row_offset is None:
+        # Instead of failing, you could iterate to the next detection 
+        # but here we raise if NO detected SKUs match the master grid
+        raise ValueError("Mapping Error: None of the detected SKUs exist in the planogram grid.")
 
-    if global_shift is None:
-        raise ValueError("Mapping Error: No valid anchors could be established from detections.")
-
-    # 2. Reconstruct the shelf using the established shift
+    # 2. RECONSTRUCTION
     reconstructed_shelf = []
     
     for i in range(len(planogram_grid)):
-        num_items_to_fetch = row_capacities.get(i, 0)
-        current_row_output = []
+        # We only reconstruct as many rows as the camera actually saw
+        if i not in row_capacities: continue
         
-        # Local map for OCR hits in this specific row
+        num_to_fetch = row_capacities[i]
+        row_output = []
+        
+        # Local map for OCR hits on this shelf
         row_dets = {d['slot']: d['sku'] for d in all_detections if d['row'] == i}
         
-        for j in range(num_items_to_fetch):
-            # If we have an OCR hit for this slot, use it
-            if j in row_dets:
-                current_row_output.append(row_dets[j])
-            else:
-                # Calculate the target index in the padded planogram
-                target_idx = global_shift + j
-                
-                if 0 <= target_idx < len(planogram_grid[i]):
-                    val = planogram_grid[i][target_idx]
-                    
-                    # If we hit padding or a break, look for the next real SKU
-                    if val in ("00000", "sectionbreak"):
-                        search_ptr = target_idx
-                        # Move forward until a real SKU is found
-                        while (search_ptr < len(planogram_grid[i]) and 
-                               planogram_grid[i][search_ptr] in ("00000", "sectionbreak")):
-                            search_ptr += 1
-                        
-                        if search_ptr < len(planogram_grid[i]):
-                            current_row_output.append(planogram_grid[i][search_ptr])
-                        else:
-                            current_row_output.append("EMPTY")
-                    else:
-                        current_row_output.append(val)
-                else:
-                    current_row_output.append("OUT_OF_BOUNDS")
+        # Determine which row in the planogram_grid corresponds to this camera row
+        target_p_row_idx = i + global_row_offset
         
-        reconstructed_shelf.append(current_row_output)
+        if 0 <= target_p_row_idx < len(planogram_grid):
+            p_row = planogram_grid[target_p_row_idx]
+            
+            for j in range(num_to_fetch):
+                if j in row_dets:
+                    row_output.append(row_dets[j])
+                else:
+                    # Apply horizontal shift
+                    target_p_col_idx = global_col_offset + j
+                    
+                    if 0 <= target_p_col_idx < len(p_row):
+                        val = p_row[target_p_col_idx]
+                        
+                        # Handle padding/breaks by skipping to next SKU
+                        if val in ("00000", "sectionbreak"):
+                            search_ptr = target_p_col_idx
+                            while (search_ptr < len(p_row) and 
+                                   p_row[search_ptr] in ("00000", "sectionbreak")):
+                                search_ptr += 1
+                            
+                            row_output.append(p_row[search_ptr] if search_ptr < len(p_row) else "EMPTY")
+                        else:
+                            row_output.append(val)
+                    else:
+                        row_output.append("OUT_OF_BOUNDS")
+        
+        reconstructed_shelf.append(row_output)
         
     return reconstructed_shelf
