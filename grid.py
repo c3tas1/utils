@@ -1,42 +1,48 @@
-valid_row_indices = [i for i, row in enumerate(list1) if len(row) > 0]
-
-def get_centroid(bbox):
-    return [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
-
-def find_nearest_vertical_robust(empty_row_idx):
-    final_results = []
+def get_top_vertical_matches(target_row_idx, list1, list2, top_n=3):
+    # 1. Identify all boxes in the row we want to fill
+    target_row_boxes = list2[target_row_idx]
     
-    # Iterate through each box in the row that needs filling
-    for box_idx, empty_bbox in enumerate(list2[empty_row_idx]):
-        target_center = get_centroid(empty_bbox)
-        candidate_matches = []
-        
-        for v_row_idx in valid_row_indices:
-            for v_box_idx, valid_bbox in enumerate(list2[v_row_idx]):
-                valid_center = get_centroid(valid_bbox)
-                
-                # Calculate absolute differences
-                dx = abs(target_center[0] - valid_center[0])
-                dy = abs(target_center[1] - valid_center[1])
-                
-                # WEIGHTED DISTANCE FORMULA
-                # We multiply dx by a factor (e.g., 2) to penalize horizontal drift
-                # but keep the logic functional even with zero overlap.
-                combined_score = math.sqrt((dx * 2)**2 + dy**2)
-                
-                candidate_matches.append({
-                    'row_idx': v_row_idx,
-                    'item_idx': v_box_idx,
-                    'score': combined_score,
-                    'value': list1[v_row_idx][v_box_idx] if v_box_idx < len(list1[v_row_idx]) else None
+    # 2. Collect all valid candidates from other rows that HAVE labels
+    candidates = []
+    for r_idx, row_boxes in enumerate(list2):
+        if r_idx == target_row_idx or not list1[r_idx]:
+            continue
+        for b_idx, box in enumerate(row_boxes):
+            if b_idx < len(list1[r_idx]): # Ensure there is a corresponding label
+                candidates.append({
+                    'coords': box,
+                    'row': r_idx,
+                    'col': b_idx,
+                    'val': list1[r_idx][b_idx]
                 })
-        
-        # Find the absolute best neighbor for this specific bounding box
-        if candidate_matches:
-            best = min(candidate_matches, key=lambda x: x['score'])
-            final_results.append(best)
-            
-    return final_results
 
-# Execute
-results = find_nearest_vertical_robust(2)
+    all_potential_matches = []
+
+    # 3. For every box in our target row, find how well it matches candidates
+    for t_idx, t_box in enumerate(target_row_boxes):
+        t_x = (t_box[0] + t_box[2]) / 2
+        t_y = (t_box[1] + t_box[3]) / 2
+
+        for cand in candidates:
+            c_box = cand['coords']
+            c_x = (c_box[0] + c_box[2]) / 2
+            c_y = (c_box[1] + c_box[3]) / 2
+
+            dx = abs(t_x - c_x)
+            dy = abs(t_y - c_y)
+
+            # Scoring: Vertical distance + Heavy Horizontal Penalty
+            # This ensures we favor boxes in the same column
+            score = math.sqrt((dx * 25)**2 + dy**2)
+
+            all_potential_matches.append({
+                'target_box_idx': t_idx,
+                'matched_val': cand['val'],
+                'matched_row': cand['row'],
+                'matched_col': cand['col'],
+                'score': score
+            })
+
+    # 4. Sort by best score and return top N
+    all_potential_matches.sort(key=lambda x: x['score'])
+    return all_potential_matches[:top_n]
