@@ -1,73 +1,51 @@
-def reconstruct_shelf_osa(all_detections, padded_grid, row_capacities):
-    """
-    all_detections: list of {'row': i, 'slot': j, 'sku': '123'}
-    padded_grid: Master SKU grid (List 1) with '00000' and 'sectionbreak'
-    row_capacities: dict {row_index: total_yolo_boxes}
-    """
-    # 1. Coordinate Locking (The "Global Anchor")
-    # We find the first valid SKU to align the camera window to the planogram
-    global_col_offset = None
-    global_row_offset = None
+def get_clean_sequence(padded_row):
+    """Returns a list of (original_index, sku) for real products only."""
+    return [(i, sku) for i, sku in enumerate(padded_row) 
+            if sku not in ("00000", "sectionbreak", "")]
 
-    for det in all_detections:
-        sku = str(det['sku']).strip()
-        # Search entire grid for the anchor to handle row/col shifts
-        for p_row_idx, p_row in enumerate(padded_grid):
-            if sku in p_row:
-                p_col_idx = p_row.index(sku)
-                global_col_offset = p_col_idx - det['slot']
-                global_row_offset = p_row_idx - det['row']
-                break
-        if global_col_offset is not None: break
-
-    # Fallback: If no anchors match the planogram, we cannot align
-    if global_col_offset is None: return []
-
-    # 2. Reconstruct visible window for all rows
-    reconstructed_shelf = []
-    detection_map = {(d['row'], d['slot']): d['sku'] for d in all_detections}
-
-    for i in sorted(row_capacities.keys()):
-        num_slots = row_capacities[i]
-        current_row_output = []
-        # Calculate which planogram row corresponds to this physical shelf
-        target_p_row_idx = i + global_row_offset
-        
-        for j in range(num_slots):
-            # Check Reality: If OCR exists and is in the correct planogram row, trust it
-            ocr_sku = detection_map.get((i, j))
+def generate_reality_for_anchor(anchor_sku, local_idx, num_slots, padded_row):
+    # 1. Get the real sequence of products for this shelf
+    clean_seq = get_clean_sequence(padded_row)
+    
+    # 2. Find where our anchor SKU sits in the physical product list
+    # We find the matching SKU that is most likely to be at this relative position
+    match_idx = -1
+    for i, (orig_idx, sku) in enumerate(clean_seq):
+        if sku == anchor_sku:
+            match_idx = i
+            break
             
-            is_valid_ocr = False
-            if 0 <= target_p_row_idx < len(padded_grid):
-                if ocr_sku and ocr_sku in padded_grid[target_p_row_idx]:
-                    is_valid_ocr = True
+    if match_idx == -1: return None # SKU not in this planogram row
 
-            if is_valid_ocr:
-                current_row_output.append(ocr_sku)
-            else:
-                # Extraction logic for missing/invalid SKUs
-                target_p_col_idx = global_col_offset + j
-                
-                if 0 <= target_p_row_idx < len(padded_grid):
-                    p_row = padded_grid[target_p_row_idx]
-                    
-                    if 0 <= target_p_col_idx < len(p_row):
-                        val = p_row[target_p_col_idx]
-                        
-                        # Section Jump Logic: Skip '00000' and 'sectionbreak' 
-                        # to find the next valid item in the sequence
-                        if val in ("00000", "sectionbreak"):
-                            search_ptr = target_p_col_idx
-                            while (search_ptr < len(p_row) and 
-                                   p_row[search_ptr] in ("00000", "sectionbreak")):
-                                search_ptr += 1
-                            
-                            current_row_output.append(p_row[search_ptr] if search_ptr < len(p_row) else "EMPTY")
-                        else:
-                            current_row_output.append(val)
-                    else:
-                        current_row_output.append("OOB")
+    # 3. Calculate where the 'Window Start' (Slot 0) sits in the Clean Sequence
+    # If anchor is at slot 2 (local_idx) and is the 10th product (match_idx),
+    # then our window starts at the 8th physical product.
+    start_clean_idx = match_idx - local_idx
+    
+    reality = []
+    for k in range(num_slots):
+        target_clean_idx = start_clean_idx + k
         
-        reconstructed_shelf.append(current_row_output)
+        if 0 <= target_clean_idx < len(clean_seq):
+            # Fetch the actual SKU from the physical sequence
+            reality.append(clean_seq[target_clean_idx][1])
+        else:
+            reality.append("VOID")
+            
+    return reality
+
+def resolve_row_truth(row_detections, num_slots, padded_row):
+    realities = []
+    
+    # Create a reality for every single SKU detection in this row
+    for slot_idx, sku in row_detections.items():
+        r = generate_reality_for_anchor(sku, slot_idx, num_slots, padded_row)
+        if r: realities.append(r)
         
-    return reconstructed_shelf
+    if not realities: return None
+    
+    # Scoring: Pick the reality that matches the most OCR results
+    # (Your existing 'get_common_reality' logic)
+    best_reality = max(realities, key=lambda r: sum(1 for idx, s in enumerate(r) 
+                                                   if idx in row_detections and s == row_detections[idx]))
+    return best_reality
